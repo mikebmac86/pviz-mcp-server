@@ -81,3 +81,6 @@ temp/
 # OS files
 Thumbs.db
 .DS_Store
+
+*CADDY_DEPLOYMENT*
+*Caddyfile.mcp*

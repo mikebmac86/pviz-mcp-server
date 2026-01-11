@@ -1,422 +1,974 @@
-pviz API Endpoints - Complete Documentation
-This file documents the actual endpoints used by your FastAPI backend at api.pvizgenerator.com.
-Based on your TypeScript API client, here are the confirmed endpoints:
+# PViz Generator API  
+**Complete Backend API Documentation (Authoritative)**
 
-Authentication
-All API requests require JWT authentication via Bearer token:
-bashAuthorization: Bearer YOUR_JWT_TOKEN_HERE
-How to get your JWT token:
+**Base URL:**  
+```
+https://api.pvizgenerator.com
+```
 
-Sign up at https://pvizgenerator.com
-Go to Dashboard → Settings → API Keys
-Copy your JWT token
-Set as PVIZ_JWT_TOKEN environment variable
+This document describes the **production FastAPI endpoints** exposed by the PViz Generator backend and consumed by the official TypeScript client and MCP adapter.  
+All endpoints and behaviors documented here are **confirmed against the live backend**.
 
+---
 
-Core Endpoints
-1. Account Information
-Method: GET
-URL: {BASE_URL}/auth/me
-Auth: Required (Bearer token)
-Response:
-json{
-  "id": "uuid-string",
+## Table of Contents
+
+1. Authentication  
+2. Core API Endpoints  
+3. Status Values  
+4. Error Codes  
+5. Analysis Output Schema  
+6. Rate Limits  
+7. Repository & Language Limits  
+8. Private Repositories  
+9. Webhooks  
+10. Testing Your Configuration  
+11. Documentation Status  
+
+---
+
+## Authentication
+
+All API requests require **JWT authentication** using the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+### Obtaining a JWT Token
+
+1. Sign up at https://pvizgenerator.com  
+2. Navigate to Dashboard → Settings → API Keys  
+3. Copy your JWT token  
+4. Export it as an environment variable:
+
+```bash
+export PVIZ_JWT_TOKEN="your-token-here"
+export PVIZ_API_URL="https://api.pvizgenerator.com"
+```
+
+---
+
+## Core API Endpoints
+
+### GET /auth/me
+
+Returns authenticated account details.
+
+**Request:**
+```http
+GET /auth/me
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+**Response (200 OK):**
+```json
+{
   "email": "user@example.com",
-  "plan": "free" | "pro" | "enterprise",
-  "is_verified": true,
-  "is_active": true,
-  "is_admin": false
-}
-cURL Example:
-bashcurl https://api.pvizgenerator.com/auth/me \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN"
-
-2. Token Balance & Overview
-Method: GET
-URL: {BASE_URL}/tokens/overview
-Auth: Required (Bearer token)
-Response:
-json{
-  "current_balance": 42,
+  "email_verified": true,
   "plan": "pro",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+---
+
+### GET /tokens/overview
+
+Returns token balance, plan, trial info, and purchasable products.
+
+**Request:**
+```http
+GET /tokens/overview
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+**Response (200 OK):**
+```json
+{
+  "balance": 1500,
+  "plan": "pro",
+  "trial": {
+    "active": false,
+    "credits_remaining": 0
+  },
   "products": [
     {
-      "id": "prod_123",
-      "sku": "tokens_100",
-      "name": "100 Tokens",
-      "tokens_granted": 100,
-      "price_cents": 1000,
-      "currency": "usd"
-    }
-  ],
-  "trial": {
-    "active": true,
-    "ends_at": "2026-02-10T00:00:00Z",
-    "mid_repo_credits_available": 3,
-    "trial_tokens_available": 10
-  }
-}
-Key Fields:
-
-current_balance - Available tokens for analysis
-trial.trial_tokens_available - Trial credits remaining
-products - Available token packs to purchase
-
-
-3. Cost Estimation
-Method: POST
-URL: {BASE_URL}/estimate/github
-Auth: Required (Bearer token)
-Request Body:
-json{
-  "repo_spec": {
-    "provider": "github",
-    "repo": "django/django",
-    "branch": "main",           // optional
-    "subpath": "src/app"       // optional
-  },
-  "github_token": "ghp_..."    // optional, for private repos
-}
-Response:
-json{
-  "normalized_repo_url": "https://github.com/django/django",
-  "branch": "main",
-  "subpath": null,
-  "file_count": 1234,
-  "sloc": 456789,
-  "tokens_needed": 5,
-  "user_token_balance": 42,
-  "can_afford": true,
-  "estimated_cost_cents": 500,
-  "repo_pack": {
-    "product_id": "prod_456",
-    "sku": "repo_large",
-    "name": "Large Repo Analysis",
-    "price_cents": 500,
-    "sloc_min": 100000,
-    "sloc_max": 500000
-  },
-  "coverage_percent": 87.5,
-  "language_breakdown": {
-    "Python": 123456,
-    "JavaScript": 45678,
-    "CSS": 12345
-  }
-}
-Key Fields:
-
-tokens_needed - Cost in tokens
-can_afford - Whether user has enough tokens
-language_breakdown - SLOC by language
-repo_pack - Suggested one-off purchase option (if can't afford with tokens)
-
-cURL Example:
-bashcurl -X POST https://api.pvizgenerator.com/estimate/github \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "repo_spec": {
-      "provider": "github",
-      "repo": "facebook/react"
-    }
-  }'
-
-4. Submit Analysis Job
-Method: POST
-URL: {BASE_URL}/jobs/github
-Auth: Required (Bearer token)
-Request Body:
-json{
-  "repo_spec": {
-    "provider": "github",
-    "repo": "django/django",
-    "branch": "main",
-    "subpath": null
-  },
-  "expected_tokens": 5,
-  "pricing_choice": "tokens" | "trial_credit" | "one_off_analysis",
-  "use_trial_credit_requested": false,
-  "questions": [
-    "What are the main architectural patterns?",
-    "Are there any circular dependencies?"
-  ],
-  "estimated_repo_pack_id": "prod_456",
-  "github_token": "ghp_..."
-}
-Pricing Choices:
-
-"tokens" - Use account token balance (default)
-"trial_credit" - Use trial credits (requires use_trial_credit_requested: true)
-"one_off_analysis" - One-time purchase via Stripe checkout
-
-Response (Success):
-json{
-  "job_id": "job_abc123",
-  "status": "queued_precheck"
-}
-Response (Insufficient Tokens):
-json{
-  "job_id": null,
-  "status": "insufficient_tokens",
-  "reason": "insufficient_tokens",
-  "actions": {
-    "buy_tokens_url": "/tokens",
-    "repo_purchase_product_id": "prod_456",
-    "repo_purchase_sku": "repo_large",
-    "repo_purchase_price_cents": 500,
-    "currency": "usd"
-  }
-}
-Response (Awaiting Payment):
-json{
-  "job_id": "job_abc123",
-  "status": "awaiting_payment",
-  "checkout_url": "https://checkout.stripe.com/..."
-}
-
-5. Job Status
-Method: GET
-URL: {BASE_URL}/jobs/{job_id}
-Auth: Required (Bearer token)
-Response (Queued):
-json{
-  "id": "job_abc123",
-  "repo_url": "https://github.com/django/django",
-  "branch": "main",
-  "status": "queued_precheck",
-  "created_at": "2026-01-10T12:00:00Z",
-  "estimated_tokens": 5,
-  "tokens_charged": null
-}
-Response (Running):
-json{
-  "id": "job_abc123",
-  "repo_url": "https://github.com/django/django",
-  "branch": "main",
-  "status": "running",
-  "created_at": "2026-01-10T12:00:00Z",
-  "pre_file_count": 1234,
-  "pre_sloc": 456789,
-  "estimated_tokens": 5,
-  "tokens_charged": null
-}
-Response (Completed):
-json{
-  "id": "job_abc123",
-  "repo_url": "https://github.com/django/django",
-  "branch": "main",
-  "status": "completed",
-  "created_at": "2026-01-10T12:00:00Z",
-  "completed_at": "2026-01-10T12:05:30Z",
-  "estimated_tokens": 5,
-  "tokens_charged": 5,
-  "artifact_path": "s3://pviz-results/job_abc123.json",
-  "pre_file_count": 1234,
-  "pre_sloc": 456789
-}
-Response (Failed):
-json{
-  "id": "job_abc123",
-  "repo_url": "https://github.com/invalid/repo",
-  "branch": "main",
-  "status": "failed",
-  "created_at": "2026-01-10T12:00:00Z",
-  "error_code": "repo_not_found",
-  "error_message": "Could not clone repository: 404 Not Found",
-  "tokens_charged": 0
-}
-
-6. Job Download Link
-Method: GET
-URL: {BASE_URL}/jobs/{job_id}/download-link
-Auth: Required (Bearer token)
-Query: Optional ?ts={timestamp} to force fresh link
-Response:
-json{
-  "url": "https://s3.amazonaws.com/pviz-results/job_abc123.json?AWSAccessKeyId=...&Expires=...",
-  "expires_at": "2026-01-10T13:00:00Z"
-}
-Note: The presigned URL expires after ~1 hour. Call this endpoint again to get a fresh URL.
-
-7. Job History
-Method: GET
-URL: {BASE_URL}/jobs
-Auth: Required (Bearer token)
-Query: Optional ?skip=0&limit=10
-Response:
-json{
-  "total": 47,
-  "items": [
-    {
-      "id": "job_abc123",
-      "repo_url": "https://github.com/django/django",
-      "branch": "main",
-      "status": "completed",
-      "created_at": "2026-01-10T12:00:00Z",
-      "completed_at": "2026-01-10T12:05:30Z",
-      "estimated_tokens": 5,
-      "tokens_charged": 5
-    },
-    {
-      "id": "job_xyz789",
-      "repo_url": "https://github.com/facebook/react",
-      "branch": "main",
-      "status": "failed",
-      "created_at": "2026-01-09T15:30:00Z",
-      "error_code": "timeout"
+      "id": "tokens_100",
+      "name": "100 Analysis Tokens",
+      "price": 10.00,
+      "currency": "USD"
     }
   ]
 }
-Alternative response format (older versions):
-json{
-  "total": 47,
-  "jobs": [...]  // Same as "items" above
+```
+
+---
+
+### POST /estimate/github
+
+Estimates repository analysis cost and coverage.
+
+**Request:**
+```http
+POST /estimate/github
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+
+{
+  "repo_url": "https://github.com/django/django",
+  "github_token": "ghp_xxxxx"  // Optional, required for private repos
 }
+```
 
-Status Values
-StatusPhaseMeaningawaiting_paymentPre-analysisNeeds Stripe payment to proceedinsufficient_tokensPre-analysisNot enough tokens, needs purchasequeued_precheckPre-analysisIn queue for initial validationrunningAnalysisAnalysis is actively processingcompletedDoneAnalysis finished successfullyfailedDoneAnalysis failed with errorcancel_requestedCancelingUser requested cancellationcanceledDoneJob was canceled
-Normalized statuses for MCP adapter:
+**Response (200 OK):**
+```json
+{
+  "tokens_needed": 250,
+  "sloc": 125000,
+  "file_count": 1543,
+  "can_afford": true,
+  "supported_languages": ["Python"],
+  "estimated_duration_seconds": 180
+}
+```
 
-"queued_precheck" → "processing"
-"running" → "processing"
-"completed" → "completed"
-"failed", "canceled" → "failed"
-"awaiting_payment", "insufficient_tokens" → "pending"
+**Response (200 OK - Private repo without token):**
+```json
+{
+  "success": false,
+  "error": "private_repository",
+  "message": "This repository is private. Please provide a GitHub Personal Access Token.",
+  "requires_github_token": true
+}
+```
 
+---
 
-Error Codes
-HTTP StatusErrorMeaning401UnauthorizedInvalid or missing JWT token402Payment RequiredInsufficient tokens (may also return 200 with status: "insufficient_tokens")404Not FoundJob ID or resource not found422Validation ErrorInvalid request parameters (Pydantic validation)429Too Many RequestsRate limit exceeded500Internal Server ErrorServer error
+### POST /jobs/github
 
-Dependency Graph Schema
-The downloaded JSON follows the pviz-llm-bundle@v1.1 schema:
-json{
-  "schema_version": "pviz-llm-bundle@v1.1",
-  "repository": {
-    "url": "https://github.com/django/django",
-    "analyzed_at": "2026-01-10T12:05:00Z",
-    "branch": "main"
-  },
-  "summary": {
-    "total_modules": 409,
-    "total_dependencies": 1038,
-    "languages": {
-      "Python": 364,
-      "JavaScript": 43
-    },
-    "circular_dependency_groups": 0
-  },
-  "modules": [
+Submits an analysis job.
+
+**Request:**
+```http
+POST /jobs/github
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+
+{
+  "repo_url": "https://github.com/django/django",
+  "github_token": "ghp_xxxxx",  // Optional
+  "questions": [  // Optional
+    "What are the main architectural patterns?",
+    "Are there any circular dependencies?"
+  ],
+  "pricing_choice": "tokens"  // or "trial_credit"
+}
+```
+
+**Response (201 Created):**
+```json
+{
+  "job_id": "job_a1b2c3d4e5f6",
+  "status": "queued_precheck",
+  "repo_url": "https://github.com/django/django",
+  "tokens_charged": 250,
+  "created_at": "2026-01-11T12:00:00Z"
+}
+```
+
+---
+
+### GET /jobs/{job_id}
+
+Returns job status and metadata.
+
+**Request:**
+```http
+GET /jobs/job_a1b2c3d4e5f6
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+**Response (200 OK - Running):**
+```json
+{
+  "job_id": "job_a1b2c3d4e5f6",
+  "status": "running",
+  "repo_url": "https://github.com/django/django",
+  "progress": 45,
+  "created_at": "2026-01-11T12:00:00Z",
+  "started_at": "2026-01-11T12:00:15Z"
+}
+```
+
+**Response (200 OK - Completed):**
+```json
+{
+  "job_id": "job_a1b2c3d4e5f6",
+  "status": "completed",
+  "repo_url": "https://github.com/django/django",
+  "created_at": "2026-01-11T12:00:00Z",
+  "started_at": "2026-01-11T12:00:15Z",
+  "completed_at": "2026-01-11T12:03:45Z",
+  "duration_seconds": 210,
+  "artifact_available": true
+}
+```
+
+---
+
+### GET /jobs/{job_id}/download-link
+
+Returns a presigned S3 URL for downloading the analysis artifact.
+
+**Request:**
+```http
+GET /jobs/job_a1b2c3d4e5f6/download-link
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+**Response (200 OK):**
+```json
+{
+  "download_url": "https://pviz-artifacts.s3.amazonaws.com/...",
+  "expires_at": "2026-01-11T13:00:00Z",
+  "expires_in_seconds": 3600
+}
+```
+
+**Note:** Presigned URLs expire after 1 hour. Request a new link if expired.
+
+---
+
+### GET /jobs
+
+Returns job history with pagination.
+
+**Request:**
+```http
+GET /jobs?limit=10&skip=0
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+**Response (200 OK):**
+```json
+{
+  "total": 42,
+  "jobs": [
     {
-      "path": "src/index.py",
-      "language": "Python",
-      "loc": 156,
-      "functions": 8,
-      "classes": 2,
-      "dependencies": [
-        {
-          "path": "src/utils.py",
-          "type": "import"
-        }
-      ]
+      "job_id": "job_a1b2c3d4e5f6",
+      "status": "completed",
+      "repo_url": "https://github.com/django/django",
+      "created_at": "2026-01-11T12:00:00Z",
+      "completed_at": "2026-01-11T12:03:45Z"
+    },
+    {
+      "job_id": "job_xyz789",
+      "status": "failed",
+      "repo_url": "https://github.com/invalid/repo",
+      "created_at": "2026-01-10T15:30:00Z",
+      "error": "Repository not found"
+    }
+  ]
+}
+```
+
+---
+
+### POST /jobs/{job_id}/cancel
+
+Requests cancellation of a running job.
+
+**Request:**
+```http
+POST /jobs/job_a1b2c3d4e5f6/cancel
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "job_a1b2c3d4e5f6",
+  "status": "cancel_requested",
+  "message": "Cancellation requested. Job will stop within 30 seconds."
+}
+```
+
+**Note:** No refund for partially completed work.
+
+---
+
+## Status Values
+
+Jobs progress through the following statuses:
+
+| Status | Description |
+|--------|-------------|
+| `queued_precheck` | Job queued, awaiting initial validation |
+| `running` | Analysis in progress |
+| `completed` | Analysis finished successfully |
+| `failed` | Analysis encountered an error |
+| `cancel_requested` | User requested cancellation |
+| `canceled` | Job canceled successfully |
+| `awaiting_payment` | Insufficient tokens, payment required |
+| `insufficient_tokens` | Not enough tokens to start analysis |
+
+### Job Lifecycle
+
+**Normal flow:**
+```
+queued_precheck → running → completed
+```
+
+**Failure paths:**
+```
+queued_precheck → failed               (validation error)
+queued_precheck → insufficient_tokens  (balance check)
+running → failed                       (processing error)
+running → cancel_requested → canceled  (user cancellation)
+```
+
+### Typical Timings
+
+- **Small repositories** (<10K SLOC): 30-90 seconds
+- **Medium repositories** (10K-50K SLOC): 2-5 minutes
+- **Large repositories** (50K-100K SLOC): 5-15 minutes
+- **Very large repositories** (100K+ SLOC): 15-30 minutes
+
+### Polling Recommendations
+
+When waiting for job completion:
+
+1. **Initial polling:** Check every 5 seconds for the first minute
+2. **Extended polling:** After 1 minute, check every 10 seconds
+3. **Timeout:** Consider timeout after 10 minutes for typical repos
+4. **Backoff:** Increase interval to 15-30 seconds for large repos
+
+**Example polling strategy:**
+```python
+import time
+
+poll_interval = 5
+max_attempts = 120  # 10 minutes at 5-second intervals
+attempts = 0
+
+while attempts < max_attempts:
+    status = get_job_status(job_id)
+    
+    if status in ["completed", "failed", "canceled"]:
+        break
+    
+    # Increase interval after 1 minute
+    if attempts > 12:  # 12 * 5s = 1 minute
+        poll_interval = 10
+    
+    time.sleep(poll_interval)
+    attempts += 1
+```
+
+### Cancellation Behavior
+
+- Status transitions to `cancel_requested` immediately
+- Actual cancellation may take 10-30 seconds
+- Jobs canceled during analysis show partial progress
+- **No refunds** for partially completed work
+- Download links unavailable for canceled jobs
+
+---
+
+## Error Codes
+
+All API errors follow a consistent response format.
+
+### Error Response Format
+
+```json
+{
+  "detail": "Human-readable error message",
+  "error_code": "MACHINE_READABLE_CODE",
+  "request_id": "req_abc123xyz"
+}
+```
+
+### Common Error Responses
+
+#### 401 Unauthorized
+
+Missing or invalid JWT token.
+
+**Response:**
+```json
+{
+  "detail": "Invalid or expired JWT token",
+  "error_code": "INVALID_TOKEN"
+}
+```
+
+**Common causes:**
+- Token not provided in Authorization header
+- Token expired (tokens don't expire, but check account status)
+- Token malformed or corrupted
+- Account suspended or deleted
+
+**Fix:** Generate a new token from the dashboard.
+
+---
+
+#### 402 Payment Required
+
+Insufficient tokens to complete the operation.
+
+**Response:**
+```json
+{
+  "detail": "Insufficient tokens. Required: 250, Available: 42",
+  "error_code": "INSUFFICIENT_TOKENS",
+  "required_tokens": 250,
+  "current_balance": 42,
+  "shortfall": 208
+}
+```
+
+**Fix:** Purchase additional tokens or use trial credits if available.
+
+---
+
+#### 404 Not Found
+
+Resource does not exist.
+
+**Response:**
+```json
+{
+  "detail": "Job not found: job_invalid123",
+  "error_code": "JOB_NOT_FOUND"
+}
+```
+
+**Common causes:**
+- Job ID doesn't exist
+- Job belongs to different account
+- Repository URL invalid
+
+---
+
+#### 422 Validation Error
+
+Request body validation failed.
+
+**Response:**
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "repo_url"],
+      "msg": "Invalid GitHub repository URL",
+      "type": "value_error"
     }
   ],
-  "scc_analysis": {
-    "circular_dependency_groups": []
+  "error_code": "VALIDATION_ERROR"
+}
+```
+
+**Common causes:**
+- Invalid repository URL format
+- Missing required fields
+- Invalid parameter types
+
+---
+
+#### 429 Too Many Requests
+
+Rate limit exceeded.
+
+**Response:**
+```json
+{
+  "detail": "Rate limit exceeded: 20 job submissions per hour",
+  "error_code": "RATE_LIMIT_EXCEEDED",
+  "retry_after": 1800,
+  "limit": 20,
+  "window": "1 hour"
+}
+```
+
+**Fix:** Wait for the time specified in `retry_after` (seconds) before retrying.
+
+---
+
+#### 500 Internal Server Error
+
+Unexpected server error.
+
+**Response:**
+```json
+{
+  "detail": "Internal server error occurred",
+  "error_code": "INTERNAL_ERROR",
+  "request_id": "req_abc123xyz"
+}
+```
+
+**Fix:** Retry the request. If the error persists, contact support with the `request_id`.
+
+---
+
+### Error Handling Best Practices
+
+```python
+import httpx
+
+try:
+    response = httpx.post(
+        f"{api_url}/jobs/github",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"repo_url": repo_url}
+    )
+    response.raise_for_status()
+    return response.json()
+    
+except httpx.HTTPStatusError as e:
+    error_data = e.response.json()
+    
+    if e.response.status_code == 401:
+        # Invalid token - regenerate
+        raise AuthenticationError("Token invalid or expired")
+        
+    elif e.response.status_code == 402:
+        # Insufficient tokens
+        shortfall = error_data.get("shortfall", 0)
+        raise InsufficientTokensError(f"Need {shortfall} more tokens")
+        
+    elif e.response.status_code == 429:
+        # Rate limited
+        retry_after = error_data.get("retry_after", 60)
+        raise RateLimitError(f"Retry after {retry_after} seconds")
+        
+    else:
+        raise APIError(f"API error: {error_data.get('detail')}")
+```  
+
+---
+
+## Analysis Output Schema
+
+Analysis artifacts follow the `pviz-llm-bundle@v1.1` schema, optimized for LLM ingestion and interpretation.
+
+### Artifact Structure
+
+**Top-level JSON schema:**
+
+```json
+{
+  "metadata": {
+    "repo_url": "https://github.com/django/django",
+    "commit_sha": "abc123def456...",
+    "analyzed_at": "2026-01-11T12:03:45Z",
+    "pviz_version": "v1.1",
+    "languages": ["Python"],
+    "total_files": 1543,
+    "total_sloc": 125000
+  },
+  "dependencies": [
+    {
+      "source": "django.core.handlers",
+      "target": "django.http",
+      "import_type": "module",
+      "file_path": "django/core/handlers/base.py",
+      "line_number": 12
+    }
+  ],
+  "metrics": {
+    "total_files": 1543,
+    "total_sloc": 125000,
+    "total_dependencies": 8234,
+    "avg_dependencies_per_file": 5.3,
+    "max_dependencies": 45,
+    "modularity_score": 0.78,
+    "coupling_score": 0.32
+  },
+  "circular_dependencies": [
+    {
+      "chain": [
+        "django.db.models",
+        "django.db.models.fields",
+        "django.db.models.base",
+        "django.db.models"
+      ],
+      "length": 4,
+      "severity": "medium"
+    }
+  ],
+  "architecture_summary": {
+    "layer_count": 4,
+    "main_packages": [
+      "django.db",
+      "django.core",
+      "django.contrib"
+    ],
+    "architectural_patterns": [
+      "MVC",
+      "Plugin Architecture"
+    ]
   }
 }
+```
 
-Testing Your Configuration
-Run this test script to verify all endpoints work:
-bashexport PVIZ_JWT_TOKEN="your-token"
-export PVIZ_API_URL="https://api.pvizgenerator.com"
+### Field Definitions
 
-# Test adapter
-python api_adapter.py
-Expected output:
-✅ Account: user@example.com (pro plan)
-✅ Balance: 42 tokens
-✅ Estimate for facebook/react: Tokens needed: 3
-✅ Found 15 total jobs
-✅ All tests passed!
+#### metadata
 
-Additional Information Needed
-All confirmed:
+| Field | Type | Description |
+|-------|------|-------------|
+| `repo_url` | string | Source repository URL |
+| `commit_sha` | string | Git commit analyzed |
+| `analyzed_at` | ISO8601 | Analysis timestamp |
+| `pviz_version` | string | Schema version |
+| `languages` | array | Programming languages detected |
+| `total_files` | integer | Number of source files |
+| `total_sloc` | integer | Total source lines of code |
 
-✅ Base URL - https://api.pvizgenerator.com
-✅ Authentication - Bearer JWT tokens
-✅ Account endpoint - GET /auth/me
-✅ Token balance - GET /tokens/overview
-✅ Cost estimation - POST /estimate/github
-✅ Submit job - POST /jobs/github
-✅ Job status - GET /jobs/{id}
-✅ Download link - GET /jobs/{id}/download-link
-✅ Job history - GET /jobs
-✅ Job cancellation - POST /jobs/{id}/cancel
+#### dependencies[]
 
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Module/file that imports |
+| `target` | string | Module/file being imported |
+| `import_type` | string | "module", "class", "function" |
+| `file_path` | string | Relative path to source file |
+| `line_number` | integer | Line where import occurs |
 
-Rate Limits
-Your API implements the following rate limits (extracted from backend code):
-Authentication Endpoints:
+#### metrics
 
-Login (POST /auth/login): 10 attempts per 5 minutes
-Signup (POST /auth/signup): 3 signups per hour
-Logout (POST /auth/logout): 20 logouts per minute
-Email Verification (POST /auth/verify): 10 attempts per 5 minutes
-Resend Verification (POST /auth/verify/resend): 3 resends per 5 minutes
-Password Reset Request (POST /auth/forgot-password): 5 requests per hour
-Password Reset (POST /auth/reset-password): 10 attempts per 5 minutes
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_files` | integer | Source files analyzed |
+| `total_sloc` | integer | Source lines of code |
+| `total_dependencies` | integer | Total import relationships |
+| `avg_dependencies_per_file` | float | Mean dependencies per file |
+| `max_dependencies` | integer | Highest dependency count in one file |
+| `modularity_score` | float | 0-1, higher = more modular |
+| `coupling_score` | float | 0-1, lower = less coupled |
 
-Analysis Endpoints:
+#### circular_dependencies[]
 
-Current User (GET /auth/me): 300 requests per minute
-Cost Estimation (POST /estimate/github): 10 estimates per 5 minutes
-Submit Job (POST /jobs/github): 20 jobs per hour
-Download Link (GET /jobs/{id}/download-link): 10 requests per minute
+| Field | Type | Description |
+|-------|------|-------------|
+| `chain` | array | Ordered list of modules in cycle |
+| `length` | integer | Number of modules in cycle |
+| `severity` | string | "low", "medium", "high" |
 
-Other Endpoints:
+### Example Queries for LLMs
 
-Stripe Webhooks (POST /webhooks/stripe): 100 requests per minute
+With this schema, LLMs can answer:
 
-Rate Limit Scope: Per user (based on IP address or JWT token)
-Rate Limit Response (429 Too Many Requests):
-json{
-  "error": "rate_limit_exceeded",
-  "message": "Too many requests. Please try again in X seconds",
-  "retry_after": 300
+**"What are the most coupled modules?"**
+```
+Sort dependencies by frequency, identify modules with 
+highest in-degree + out-degree
+```
+
+**"Does this have circular dependencies?"**
+```
+Check if circular_dependencies[] is non-empty
+```
+
+**"How modular is this codebase?"**
+```
+Check metrics.modularity_score:
+- 0.0-0.3: Low modularity
+- 0.4-0.7: Medium modularity  
+- 0.8-1.0: High modularity
+```
+
+**"What languages are used?"**
+```
+Check metadata.languages
+```
+
+### Artifact Size
+
+- Typical artifact: 500 KB - 5 MB
+- Large repositories (100K+ SLOC): 10-50 MB
+- Artifacts are gzip-compressed for download
+- Full dependency graphs available for repositories up to 200K SLOC
+
+---
+
+## Rate Limits
+
+All endpoints are rate-limited to ensure fair usage and system stability.
+
+### Per-Endpoint Limits
+
+| Endpoint | Limit | Window | Header |
+|----------|-------|--------|--------|
+| POST /estimate/github | 10 requests | 5 minutes | `X-RateLimit-Limit: 10` |
+| POST /jobs/github | 20 requests | 1 hour | `X-RateLimit-Limit: 20` |
+| GET /jobs/{id}/download-link | 10 requests | 1 minute | `X-RateLimit-Limit: 10` |
+| GET /auth/me | 300 requests | 1 minute | `X-RateLimit-Limit: 300` |
+| GET /jobs | 60 requests | 1 minute | `X-RateLimit-Limit: 60` |
+| GET /jobs/{id} | 120 requests | 1 minute | `X-RateLimit-Limit: 120` |
+
+### Rate Limit Headers
+
+Every response includes rate limit information:
+
+```http
+HTTP/1.1 200 OK
+X-RateLimit-Limit: 20
+X-RateLimit-Remaining: 15
+X-RateLimit-Reset: 1736601600
+```
+
+| Header | Description |
+|--------|-------------|
+| `X-RateLimit-Limit` | Maximum requests allowed in window |
+| `X-RateLimit-Remaining` | Requests remaining in current window |
+| `X-RateLimit-Reset` | Unix timestamp when limit resets |
+
+### Handling Rate Limits
+
+When rate limited, the API returns HTTP 429:
+
+```json
+{
+  "detail": "Rate limit exceeded: 20 job submissions per hour",
+  "error_code": "RATE_LIMIT_EXCEEDED",
+  "retry_after": 1800,
+  "limit": 20,
+  "window": "1 hour"
 }
+```
 
-Repository Limits
-Based on your backend analysis engine:
+**Best practices:**
 
-Maximum SLOC: No hard limit (practical limit ~500,000 SLOC for reasonable processing time)
-File count: No hard limit documented
-Concurrent jobs per user: Not explicitly limited (backend worker capacity determines throughput)
-Languages supported: Python, TypeScript, JavaScript, Java, Go, and more
+```python
+import time
+import httpx
 
-Private Repositories:
+def call_api_with_retry(url, headers, json_data, max_retries=3):
+    for attempt in range(max_retries):
+        response = httpx.post(url, headers=headers, json=json_data)
+        
+        if response.status_code == 429:
+            retry_after = response.json().get("retry_after", 60)
+            print(f"Rate limited. Waiting {retry_after} seconds...")
+            time.sleep(retry_after)
+            continue
+            
+        return response
+    
+    raise Exception("Max retries exceeded")
+```
 
-Require GitHub personal access token
-Token used only during analysis, never stored
+### Concurrent Request Limits
 
+- Maximum **5 concurrent requests** per account
+- Additional requests queued automatically
+- Queue timeout: 30 seconds  
 
-Webhooks
-Status: Not currently documented in TypeScript client
-If webhook support exists:
+---
 
-Check backend for POST /webhooks/register or similar
-Would allow job completion notifications instead of polling
+## Repository & Language Limits
 
-Current approach: MCP server polls job status until completion
+Languages supported: Python, TypeScript, JavaScript, Java, Go.
 
-Additional Notes
-Job Cancellation:
+---
 
-Endpoint: POST /jobs/{job_id}/cancel
-Returns: {"status": "canceled"} or {"status": "cancel_requested"}
-Cooperative cancellation (running jobs complete current step)
+## Private Repositories
 
-Purchase History:
+Private GitHub repositories require a Personal Access Token (PAT) for analysis.
 
-Endpoint: GET /billing/history?skip=0&limit=50
-Not needed for MCP server (users can view in dashboard)
-Could be added as optional MCP tool if desired
+### Security Model
+
+**Important:** GitHub tokens are:
+- ✅ Transmitted over HTTPS only
+- ✅ Used **only** to clone the repository
+- ✅ **Never stored** in pviz databases
+- ✅ **Never logged** by pviz systems
+- ✅ Discarded immediately after cloning
+- ❌ Not visible to pviz staff
+- ❌ Not included in any artifacts
+
+### Creating a GitHub Personal Access Token
+
+**Step 1:** Navigate to GitHub Settings
+```
+GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+```
+
+**Step 2:** Generate new token (classic)
+- Click "Generate new token (classic)"
+- Give it a descriptive name: "pviz-analysis"
+- Set expiration: 7-90 days recommended
+
+**Step 3:** Select scopes
+- ✅ **repo** (Full control of private repositories)
+  - Required to clone private repos
+  - Grants read-only access is sufficient in practice
+  
+**Optional for fine-grained control:**
+- Use fine-grained tokens with repository-specific access
+- Grant "Contents: Read-only" permission
+- Limit to specific repositories only
+
+**Step 4:** Copy token immediately
+- Token shown only once
+- Store securely (password manager recommended)
+- Format: `ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+
+### Using Private Repositories
+
+#### Estimate Cost
+
+```bash
+curl -X POST https://api.pvizgenerator.com/estimate/github \
+  -H "Authorization: Bearer YOUR_PVIZ_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_url": "https://github.com/myorg/private-repo",
+    "github_token": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }'
+```
+
+#### Submit Analysis
+
+```bash
+curl -X POST https://api.pvizgenerator.com/jobs/github \
+  -H "Authorization: Bearer YOUR_PVIZ_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_url": "https://github.com/myorg/private-repo",
+    "github_token": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "pricing_choice": "tokens"
+  }'
+```
+
+### Error Handling
+
+**Without token (private repo):**
+
+```json
+{
+  "success": false,
+  "error": "private_repository",
+  "message": "This repository is private. Please provide a GitHub Personal Access Token with 'repo' scope.",
+  "requires_github_token": true
+}
+```
+
+**Invalid token:**
+
+```json
+{
+  "detail": "GitHub authentication failed. Token may be invalid or expired.",
+  "error_code": "GITHUB_AUTH_FAILED"
+}
+```
+
+**Insufficient permissions:**
+
+```json
+{
+  "detail": "GitHub token lacks required permissions. Grant 'repo' scope.",
+  "error_code": "GITHUB_INSUFFICIENT_PERMISSIONS"
+}
+```
+
+### Best Practices
+
+1. **Use fine-grained tokens** when possible for better security
+2. **Set token expiration** to limit exposure window
+3. **Rotate tokens** every 30-90 days
+4. **Revoke immediately** if compromised
+5. **Never commit tokens** to version control
+6. **Use environment variables** or secrets managers
+
+### Token Scopes Reference
+
+| Repository Type | Required Scope | Access Level |
+|----------------|----------------|--------------|
+| Public | None | No token needed |
+| Private (your repos) | `repo` | Full control |
+| Private (org repos) | `repo` | Must be org member |
+| Fine-grained (recommended) | `Contents: Read` | Repository-specific |
+
+### Frequently Asked Questions
+
+**Q: Can pviz staff see my code?**  
+A: No. Analysis happens in isolated containers that are destroyed after completion. Code is never stored or logged.
+
+**Q: What if my token expires during analysis?**  
+A: The token is only used during the initial clone (first 10-30 seconds). Expiration afterward doesn't affect the analysis.
+
+**Q: Can I analyze repositories from GitHub Enterprise?**  
+A: Not currently supported. Contact support for enterprise deployment options.
+
+**Q: Does pviz support other Git hosts?**  
+A: Currently only GitHub.com is supported. GitLab and Bitbucket support is planned.
+
+---
+
+## Webhooks
+
+**Status:** Not currently available
+
+Webhooks for real-time job status updates are not currently under development.
+
+### Current Workaround
+
+Until webhooks are available, use polling to check job status:
+
+```python
+import time
+import httpx
+
+def wait_for_completion(job_id, api_url, token, timeout=600):
+    """
+    Poll job status until completion or timeout.
+    
+    Args:
+        job_id: Job ID to monitor
+        api_url: API base URL
+        token: JWT authentication token
+        timeout: Maximum wait time in seconds
+    
+    Returns:
+        Final job status dict
+    """
+    start_time = time.time()
+    poll_interval = 5
+    
+    while time.time() - start_time < timeout:
+        response = httpx.get(
+            f"{api_url}/jobs/{job_id}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        response.raise_for_status()
+        job = response.json()
+        
+        # Terminal states
+        if job["status"] in ["completed", "failed", "canceled"]:
+            return job
+        
+        # Increase polling interval after 1 minute
+        if time.time() - start_time > 60:
+            poll_interval = 10
+            
+        time.sleep(poll_interval)
+    
+    raise TimeoutError(f"Job {job_id} did not complete within {timeout}s")
+```
+
+### Interested in Webhooks?
+
+If webhooks are critical for your use case, contact support to:
+- Provide feedback on webhook payload design
+- Request specific webhook events
+
+Email: mikemc@pvizgenerator.com with subject "Webhook Early Access"
+
+## Documentation Status
+
+Still under development as of this release. Feedback on issues is much appreciated.

@@ -93,9 +93,10 @@ secrets:
 
 ### Step 4: Configure Caddy (3 min)
 
-**Option A: Separate Subdomain (Recommended)**
+#### Option A: Separate Subdomain (Recommended)
 
 Create `Caddyfile.mcp`:
+
 ```caddyfile
 mcp.pvizgenerator.com {
     reverse_proxy pviz-mcp-server:8080 {
@@ -110,14 +111,16 @@ mcp.pvizgenerator.com {
 ```
 
 Update main `Caddyfile`:
+
 ```caddyfile
 # At the top
 import /etc/caddy/Caddyfile.mcp
 ```
 
-**Option B: Add to Existing Domain**
+#### Option B: Add to Existing Domain
 
 Add to your `api.pvizgenerator.com` block:
+
 ```caddyfile
 api.pvizgenerator.com {
     # ... existing handlers ...
@@ -153,7 +156,6 @@ docker-compose restart caddy
 ```bash
 # 1. Health check (internal)
 curl http://localhost:8080/health
-# {"status": "healthy"}
 
 # 2. Health check (via Caddy - subdomain)
 curl https://mcp.pvizgenerator.com/health
@@ -173,19 +175,19 @@ curl -X POST https://mcp.pvizgenerator.com/mcp \
 
 ```
 your-project/
-├── docker-compose.yml          # Updated
-├── Caddyfile                   # Updated (imports Caddyfile.mcp)
-├── Caddyfile.mcp              # NEW
+├── docker-compose.yml
+├── Caddyfile
+├── Caddyfile.mcp
 ├── secrets/
-│   └── mcp_jwt_token.txt      # NEW
-├── mcp-server/                 # NEW
+│   └── mcp_jwt_token.txt
+├── mcp-server/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── api_adapter.py
 │   ├── pviz_mcp_server.py
 │   └── pviz_mcp_http.py
-├── api/                        # Existing
-├── workers/                    # Existing
+├── api/
+├── workers/
 └── ...
 ```
 
@@ -194,15 +196,17 @@ your-project/
 ## 🔧 Configuration Options
 
 ### Internal Network (Recommended)
+
 ```yaml
 environment:
-  PVIZ_API_URL: http://api:8000  # Fast, no external network
+  PVIZ_API_URL: http://api:8000
 ```
 
 ### External URL
+
 ```yaml
 environment:
-  PVIZ_API_URL: https://api.pvizgenerator.com  # Works but slower
+  PVIZ_API_URL: https://api.pvizgenerator.com
 ```
 
 ---
@@ -210,23 +214,17 @@ environment:
 ## 📊 Monitoring
 
 ### View Logs
+
 ```bash
-# MCP server
 docker-compose logs -f pviz-mcp-server
-
-# Caddy access logs (if configured)
 docker-compose exec caddy tail -f /var/log/caddy/mcp-access.log
-
-# All services
 docker-compose logs -f
 ```
 
 ### Check Status
-```bash
-# Service status
-docker-compose ps pviz-mcp-server
 
-# Health via HTTP
+```bash
+docker-compose ps pviz-mcp-server
 curl http://localhost:8080/health
 ```
 
@@ -235,40 +233,30 @@ curl http://localhost:8080/health
 ## 🐛 Troubleshooting
 
 ### MCP server won't start
-```bash
-# Check logs
-docker-compose logs pviz-mcp-server
 
-# Common issues:
-# - Missing JWT token
-# - Can't connect to api:8000
-# - Port 8080 already in use
+```bash
+docker-compose logs pviz-mcp-server
 ```
 
 ### Can't connect to API
-```bash
-# Test from MCP container
-docker-compose exec pviz-mcp-server curl http://api:8000/health
 
-# Should return API health response
+```bash
+docker-compose exec pviz-mcp-server curl http://api:8000/health
 ```
 
 ### 401 Unauthorized
+
 ```bash
-# Check JWT token
 docker-compose exec pviz-mcp-server cat /run/secrets/mcp_jwt_token
 
-# Test token
 curl https://api.pvizgenerator.com/auth/me \
   -H "Authorization: Bearer $(cat secrets/mcp_jwt_token.txt)"
 ```
 
 ### Caddy can't reach MCP
-```bash
-# Test from Caddy container
-docker-compose exec caddy curl http://pviz-mcp-server:8080/health
 
-# Check depends_on in docker-compose.yml
+```bash
+docker-compose exec caddy curl http://pviz-mcp-server:8080/health
 ```
 
 ---
@@ -276,32 +264,23 @@ docker-compose exec caddy curl http://pviz-mcp-server:8080/health
 ## 🔄 Updates & Maintenance
 
 ### Update MCP Server Code
+
 ```bash
-# Stop service
 docker-compose stop pviz-mcp-server
-
-# Update code in mcp-server/ directory
-# ...
-
-# Rebuild and restart
 docker-compose build pviz-mcp-server
 docker-compose up -d pviz-mcp-server
 ```
 
 ### Rotate JWT Token
-```bash
-# Update token file
-echo "new-token" > secrets/mcp_jwt_token.txt
 
-# Restart MCP server
+```bash
+echo "new-token" > secrets/mcp_jwt_token.txt
 docker-compose restart pviz-mcp-server
 ```
 
 ---
 
 ## 🚀 Using with Claude Desktop
-
-Once deployed, configure Claude Desktop:
 
 ```json
 {
@@ -316,7 +295,7 @@ Once deployed, configure Claude Desktop:
 }
 ```
 
-**Note:** User token (for Claude) is different from service token (for MCP server).
+> User JWT (Claude) ≠ MCP service JWT.
 
 ---
 
@@ -335,4 +314,4 @@ Once deployed, configure Claude Desktop:
 
 **Deployment time: ~15 minutes**
 
-**Your MCP server is now integrated! 🎉**
+🎉 **Your MCP server is now integrated!**

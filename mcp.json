@@ -1,8 +1,8 @@
 {
   "name": "pviz-dependency-analyzer",
   "displayName": "pviz Dependency Analyzer",
-  "description": "Polyglot dependency analysis for codebases. Detects circular dependencies, extracts metrics, and visualizes architecture for JavaScript, TypeScript, and Python projects.",
-  "version": "1.0.0",
+  "description": "Polyglot dependency analysis for codebases. Detects circular dependencies, extracts metrics, and visualizes architecture for Python, TypeScript, JavaScript, Java, and Go projects.",
+  "version": "2.0.0",
   "author": {
     "name": "pviz Team",
     "url": "https://pvizgenerator.com"
@@ -29,44 +29,44 @@
     "javascript",
     "typescript",
     "python",
+    "java",
+    "go",
     "architecture",
     "polyglot"
   ],
   "capabilities": {
     "tools": [
       {
+        "name": "check_account_balance",
+        "description": "Get account email, plan type, and current token balance",
+        "parameters": []
+      },
+      {
+        "name": "estimate_analysis_cost",
+        "description": "Estimate token cost for analyzing a repository before submission",
+        "parameters": [
+          "repo_url",
+          "github_token"
+        ]
+      },
+      {
         "name": "analyze_repository",
         "description": "Analyze a Git repository for dependency structure and architecture",
         "parameters": [
           "repo_url",
-          "languages",
           "wait_for_completion",
-          "include_full_graph"
+          "include_full_graph",
+          "pricing_choice",
+          "questions",
+          "github_token"
         ]
       },
       {
-        "name": "get_circular_dependencies",
-        "description": "Find circular dependency chains in a repository",
+        "name": "get_job_history",
+        "description": "Get recent analysis job history with pagination",
         "parameters": [
-          "repo_url",
-          "wait_for_completion"
-        ]
-      },
-      {
-        "name": "get_repository_metrics",
-        "description": "Get high-level architecture metrics without downloading full graph",
-        "parameters": [
-          "repo_url",
-          "wait_for_completion"
-        ]
-      },
-      {
-        "name": "compare_repositories",
-        "description": "Compare architecture of two repositories side-by-side",
-        "parameters": [
-          "repo_url_1",
-          "repo_url_2",
-          "wait_for_completion"
+          "limit",
+          "skip"
         ]
       },
       {
@@ -77,18 +77,48 @@
         ]
       },
       {
-        "name": "download_dependency_graph",
-        "description": "Download the complete dependency graph from S3",
+        "name": "retrieve_past_result",
+        "description": "Download and return complete analysis artifact from a completed job",
         "parameters": [
-          "s3_url"
+          "job_id",
+          "include_full_graph"
+        ]
+      },
+      {
+        "name": "get_circular_dependencies",
+        "description": "Detect circular dependency chains from an analysis artifact",
+        "parameters": [
+          "artifact"
+        ]
+      },
+      {
+        "name": "get_repository_metrics",
+        "description": "Extract high-level architectural metrics from an analysis artifact",
+        "parameters": [
+          "artifact"
+        ]
+      },
+      {
+        "name": "compare_repositories",
+        "description": "Compare architecture of two repositories side-by-side",
+        "parameters": [
+          "repo_url_1",
+          "repo_url_2"
+        ]
+      },
+      {
+        "name": "download_dependency_graph",
+        "description": "Get presigned S3 URL for downloading complete dependency graph JSON",
+        "parameters": [
+          "job_id"
         ]
       }
     ],
     "resources": [
       {
         "uri": "pviz://schema",
-        "name": "pviz Schema Documentation",
-        "description": "Documentation of the pviz dependency graph JSON schema"
+        "name": "pviz-llm-bundle@v1.1 Schema",
+        "description": "Complete documentation of the pviz dependency graph JSON schema"
       },
       {
         "uri": "pviz://examples",
@@ -111,6 +141,13 @@
           "repo_url_1",
           "repo_url_2"
         ]
+      },
+      {
+        "name": "check_circular_dependencies_prompt",
+        "description": "Template for detecting circular dependencies",
+        "arguments": [
+          "repo_url"
+        ]
       }
     ]
   },
@@ -123,13 +160,23 @@
     "env": {
       "PVIZ_JWT_TOKEN": {
         "required": true,
-        "description": "JWT token for api.pvizgenerator.com authentication",
+        "description": "JWT token for api.pvizgenerator.com authentication (get from Dashboard → Settings → API Keys)",
         "secret": true
       },
       "PVIZ_API_URL": {
         "required": false,
         "description": "Base URL for pviz API",
         "default": "https://api.pvizgenerator.com"
+      },
+      "PVIZ_POLL_INTERVAL": {
+        "required": false,
+        "description": "Job status polling interval in seconds",
+        "default": "5"
+      },
+      "PVIZ_MAX_POLL_ATTEMPTS": {
+        "required": false,
+        "description": "Maximum polling attempts before timeout",
+        "default": "60"
       }
     }
   },
@@ -141,34 +188,59 @@
       "docker": true,
       "serverless": true,
       "platforms": [
-        "AWS Lambda",
         "Google Cloud Run",
-        "Azure Functions",
-        "Fly.io"
+        "AWS ECS/Fargate",
+        "Fly.io",
+        "Docker Compose"
       ]
     }
   },
   "languages": [
-    "JavaScript",
+    "Python",
     "TypeScript",
-    "Python"
+    "JavaScript",
+    "Java",
+    "Go"
   ],
   "requirements": {
     "python": ">=3.8",
     "dependencies": [
       "mcp>=1.0.0",
       "httpx>=0.27.0",
-      "starlette>=0.37.0",
+      "fastapi>=0.110.0",
       "uvicorn>=0.29.0"
     ]
   },
+  "limits": {
+    "max_sloc": 500000,
+    "max_files": 10000,
+    "analysis_timeout_minutes": 30,
+    "rate_limits": {
+      "cost_estimation": "10 per 5 minutes",
+      "job_submission": "20 per hour",
+      "download_links": "10 per minute"
+    }
+  },
   "pricing": {
     "model": "usage-based",
-    "description": "Requires pvizgenerator.com account with credits. Free MCP server, pay for analysis API calls.",
-    "free_tier": "Available with pvizgenerator.com free tier",
+    "description": "Requires pvizgenerator.com account with tokens. Free and open-source MCP server code (MIT license), pay only for backend analysis API usage.",
+    "free_tier": "Trial credits available with new accounts",
+    "typical_costs": {
+      "small_repo": "50-150 tokens",
+      "medium_repo": "150-300 tokens",
+      "large_repo": "300-600 tokens"
+    },
     "url": "https://pvizgenerator.com/pricing"
   },
   "examples": [
+    {
+      "query": "Check my pviz account balance",
+      "description": "View account information and token balance"
+    },
+    {
+      "query": "Estimate the cost for analyzing django/django",
+      "description": "Get cost estimate before analyzing"
+    },
     {
       "query": "Analyze https://github.com/django/django and tell me about its architecture",
       "description": "Analyze Django's codebase architecture"
@@ -180,12 +252,22 @@
     {
       "query": "Compare the architecture of Vue.js and React",
       "description": "Side-by-side comparison of two frameworks"
+    },
+    {
+      "query": "Show my recent pviz analyses",
+      "description": "View analysis job history"
     }
   ],
   "documentation": {
     "readme": "README.md",
     "setup": "SETUP.md",
-    "api": "docs/API_ENDPOINTS.md",
-    "troubleshooting": "docs/TROUBLESHOOTING.md"
+    "api_reference": "API_ENDPOINTS.md",
+    "tools_reference": "TOOLS_REFERENCE.md",
+    "examples": "EXAMPLES.md",
+    "architecture": "ARCHITECTURE.md",
+    "faq": "FAQ.md",
+    "quick_reference": "QUICK_REFERENCE.md",
+    "troubleshooting": "TROUBLESHOOTING.md",
+    "integration": "INTEGRATION_GUIDE.md"
   }
 }
