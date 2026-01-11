@@ -2,6 +2,10 @@
 #
 # Add this to your existing Caddyfile to expose the MCP server
 #
+#**Note:** This guide is primarily for integrating the MCP server into the 
+# pviz production infrastructure. If you're an end user looking to self-host,
+# see SETUP.md for general Docker deployment or cloud platform options.
+#
 # ============================================================================
 # Option 1: Separate subdomain (RECOMMENDED)
 # ============================================================================
