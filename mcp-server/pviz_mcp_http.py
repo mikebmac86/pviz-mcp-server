@@ -4,10 +4,10 @@ HTTP/SSE Transport Wrapper for pviz MCP Server
 Routes:
   - GET  /health         : health check
   - GET  /               : info/capabilities
-  - GET  /mcp            : MCP discovery (what endpoints to call)
-  - GET  /mcp/           : same as /mcp
-  - GET  /mcp/sse        : SSE endpoint (served by MCP SDK)
-  - POST /mcp/messages   : message endpoint (served by MCP SDK)
+  - GET  /mcp            : redirect -> /mcp/ (so clients don't hit 307->404)
+  - /mcp/*               : MCP SSE transport (served by MCP SDK)
+      - GET  /mcp/sse
+      - POST /mcp/messages
 
 Deploy behind Caddy or any reverse proxy.
 """
@@ -37,7 +37,9 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 async def health_check(request):
-    return JSONResponse({"status": "healthy", "service": "pviz-mcp-server", "transport": "sse"})
+    return JSONResponse(
+        {"status": "healthy", "service": "pviz-mcp-server", "transport": "sse"}
+    )
 
 
 async def info_endpoint(request):
@@ -50,7 +52,7 @@ async def info_endpoint(request):
             "backend_api": os.getenv("PVIZ_API_URL", "https://api.pvizgenerator.com"),
             "endpoints": {
                 "health": "/health",
-                "mcp_discovery": "/mcp",
+                "mcp_base": "/mcp",
                 "mcp_sse": "/mcp/sse",
                 "mcp_messages": "/mcp/messages",
             },
@@ -58,32 +60,12 @@ async def info_endpoint(request):
     )
 
 
-def _mcp_discovery_payload() -> dict:
-    # “Base URL + relative endpoints” pattern is what many clients want.
-    return {
-        "transport": "sse",
-        "endpoints": {
-            "sse": "/mcp/sse",
-            "messages": "/mcp/messages",
-        },
-        "notes": [
-            "Use GET /mcp/sse to establish an SSE session.",
-            "Send MCP messages via POST /mcp/messages.",
-        ],
-    }
+async def mcp_redirect(request):
+    # Ensure /mcp works even if the transport expects /mcp/
+    return RedirectResponse(url="/mcp/", status_code=307)
 
 
-async def mcp_discovery(request):
-    # Return a stable discovery doc instead of redirecting to /mcp/ and 404ing.
-    return JSONResponse(_mcp_discovery_payload())
-
-
-async def mcp_discovery_slash(request):
-    # Some clients/proxies will request /mcp/ explicitly. Keep it 200 and identical.
-    return JSONResponse(_mcp_discovery_payload())
-
-
-# Optional: respond explicitly to OAuth discovery probes (clients sometimes check these)
+# Optional: respond explicitly to OAuth discovery probes (some clients check these)
 async def oauth_not_supported(request):
     return JSONResponse(
         {
@@ -94,28 +76,28 @@ async def oauth_not_supported(request):
     )
 
 
-# MCP SDK SSE app
+# MCP SDK SSE ASGI app (this is what mcp-remote expects to talk to at /mcp/*)
 mcp_asgi_app = mcp.sse_app()
 
 routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
     Route("/", endpoint=info_endpoint, methods=["GET"]),
 
-    # IMPORTANT: Handle /mcp and /mcp/ explicitly so clients don't see 307->404
-    Route("/mcp", endpoint=mcp_discovery, methods=["GET", "POST"]),
-    Route("/mcp/", endpoint=mcp_discovery_slash, methods=["GET", "POST"]),
+    # Make /mcp a redirect, and let the mounted transport handle /mcp/*
+    Route("/mcp", endpoint=mcp_redirect, methods=["GET"]),
 
-    # Optional OAuth probe endpoints (keep 404 but with explicit JSON)
+    # Optional OAuth probe endpoints
     Route("/.well-known/oauth-protected-resource", endpoint=oauth_not_supported, methods=["GET"]),
     Route("/.well-known/oauth-protected-resource/mcp", endpoint=oauth_not_supported, methods=["GET"]),
     Route("/.well-known/oauth-authorization-server", endpoint=oauth_not_supported, methods=["GET"]),
 
-    # Mount the MCP transport under /mcp for /mcp/sse and /mcp/messages
+    # Mount MCP transport under /mcp (handles /mcp/sse and /mcp/messages)
     Mount("/mcp", app=mcp_asgi_app),
 ]
 
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
 
+# CORS only if explicitly configured
 cors_origins = os.getenv("CORS_ORIGINS")
 if cors_origins:
     origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
