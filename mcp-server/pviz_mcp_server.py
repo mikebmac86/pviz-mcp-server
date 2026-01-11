@@ -2,22 +2,21 @@
 pviz MCP Server - Production Version
 Integrates with existing FastAPI backend at api.pvizgenerator.com
 
-This file defines MCP tools and backend orchestration.
-For HTTP deployment (Docker/Caddy), run pviz_mcp_http.py as the ASGI app.
+This server exposes pviz's dependency analysis capabilities to LLMs via MCP protocol.
 """
 
 from __future__ import annotations
 
 import os
 import asyncio
+import httpx
 import random
 import logging
 from typing import Any, Dict, Optional, List
+from datetime import datetime
 from urllib.parse import urlparse
 
-import httpx
 from mcp.server.fastmcp import FastMCP
-
 from api_adapter import PvizAPIAdapter
 
 # -----------------------------------------------------------------------------
@@ -35,7 +34,7 @@ mcp = FastMCP("pviz-dependency-analyzer")
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-API_BASE_URL = os.getenv("PVIZ_API_URL", "https://api.pvizgenerator.com")
+API_BASE_URL = os.getenv("PVIZ_API_URL", "https://api.pvizgenerator.com").rstrip("/")
 
 POLL_MIN_SLEEP_S = float(os.getenv("PVIZ_POLL_MIN_SLEEP", "5"))
 POLL_MAX_SLEEP_S = float(os.getenv("PVIZ_POLL_MAX_SLEEP", "30"))
@@ -52,7 +51,7 @@ TERMINAL_SUCCESS = {"completed"}
 TERMINAL_FAILURE = {
     "failed",
     "canceled",
-    "cancelled",  # tolerate spelling
+    "cancelled",
     "insufficient_tokens",
     "awaiting_payment",
 }
@@ -64,44 +63,60 @@ TERMINAL_STATES = TERMINAL_SUCCESS | TERMINAL_FAILURE
 class PvizAPIError(Exception):
     pass
 
+
 # -----------------------------------------------------------------------------
-# JWT / Adapter
+# JWT loading (ENV or FILE)
 # -----------------------------------------------------------------------------
-def _load_jwt() -> str:
+def _read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_jwt_token() -> str:
     """
-    Loads JWT from PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE (docker secret style).
+    Load JWT token from:
+      1) PVIZ_JWT_TOKEN (direct env)
+      2) PVIZ_JWT_TOKEN_FILE (docker secret file path)
     """
     tok = os.getenv("PVIZ_JWT_TOKEN")
     if tok and tok.strip():
         return tok.strip()
 
-    tok2 = None
-    if hasattr(PvizAPIAdapter, "load_jwt_token_from_env"):
-        tok2 = PvizAPIAdapter.load_jwt_token_from_env()  # type: ignore[attr-defined]
-    if tok2 and tok2.strip():
-        return tok2.strip()
+    tok_file = os.getenv("PVIZ_JWT_TOKEN_FILE")
+    if tok_file and tok_file.strip():
+        try:
+            raw = _read_text_file(tok_file.strip())
+            tok2 = (raw or "").strip()
+            if tok2:
+                return tok2
+        except FileNotFoundError as e:
+            raise PvizAPIError(
+                f"PVIZ_JWT_TOKEN_FILE points to missing file: {tok_file!r}"
+            ) from e
+        except Exception as e:
+            raise PvizAPIError(
+                f"Failed to read PVIZ_JWT_TOKEN_FILE={tok_file!r}: {e}"
+            ) from e
 
-    raise PvizAPIError("JWT token not configured (set PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE)")
+    raise PvizAPIError("JWT not configured: set PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE")
+
 
 def _adapter() -> PvizAPIAdapter:
-    return PvizAPIAdapter(API_BASE_URL, _load_jwt())
+    return PvizAPIAdapter(API_BASE_URL, load_jwt_token())
 
-# -----------------------------------------------------------------------------
-# httpx client (shared)
-# -----------------------------------------------------------------------------
+
 _client: Optional[httpx.AsyncClient] = None
+
 
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                timeout=HTTP_TIMEOUT_S,
-                connect=HTTP_CONNECT_TIMEOUT_S,
-            ),
+            timeout=httpx.Timeout(timeout=HTTP_TIMEOUT_S, connect=HTTP_CONNECT_TIMEOUT_S),
             follow_redirects=True,
         )
     return _client
+
 
 async def _close_client() -> None:
     global _client
@@ -109,23 +124,40 @@ async def _close_client() -> None:
         await _client.aclose()
     _client = None
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+
 def _normalize_repo_url(repo_url: str) -> str:
     repo_url = (repo_url or "").strip()
     if not repo_url:
         raise PvizAPIError("repo_url is required")
 
-    # Shorthand: owner/repo
+    # GitHub shorthand
     if "://" not in repo_url and repo_url.count("/") == 1:
         return f"https://github.com/{repo_url}"
 
     parsed = urlparse(repo_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if not parsed.scheme or not parsed.netloc:
         raise PvizAPIError("Invalid repo_url")
-
     return repo_url
+
+
+def _coerce_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if s.isdigit():
+                return int(s)
+    except Exception:
+        pass
+    return default
+
 
 async def _download_json_streaming(url: str) -> Dict[str, Any]:
     client = _get_client()
@@ -140,12 +172,15 @@ async def _download_json_streaming(url: str) -> Dict[str, Any]:
             total += len(chunk)
             if total > MAX_ARTIFACT_BYTES:
                 raise PvizAPIError(
-                    f"Artifact exceeds size limit ({total} > {MAX_ARTIFACT_BYTES}). "
-                    "Increase PVIZ_MAX_ARTIFACT_BYTES or disable include_full_graph."
+                    f"Artifact exceeds size limit: {total} > {MAX_ARTIFACT_BYTES}"
                 )
             chunks.append(chunk)
 
-    return httpx.Response(200, content=b"".join(chunks)).json()
+    try:
+        return httpx.Response(200, content=b"".join(chunks)).json()
+    except Exception as e:
+        raise PvizAPIError(f"Downloaded artifact is not valid JSON: {e}") from e
+
 
 async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
     api = _adapter()
@@ -154,36 +189,25 @@ async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
 
     for _ in range(MAX_POLL_ATTEMPTS):
         status = await api.get_job_status(client, job_id)
-        state = api.get_job_status_value(status)
 
-        if state in TERMINAL_STATES:
+        # IMPORTANT: api_adapter.get_job_status_value() currently returns
+        # "completed" | "failed" | "processing" | "pending" | <raw>.
+        # So we handle both normalized and raw.
+        state = (api.get_job_status_value(status) or "").lower().strip()
+        raw_state = (status.get("status") or "").lower().strip() if isinstance(status, dict) else ""
+
+        # Treat terminal if either normalized says completed/failed OR raw is terminal-like.
+        if state in ("completed", "failed"):
+            return status
+        if raw_state in TERMINAL_STATES:
             return status
 
         jitter = (random.random() * 2 - 1) * (sleep_s * POLL_JITTER_RATIO)
         await asyncio.sleep(max(0.1, sleep_s + jitter))
-        sleep_s = min(POLL_MAX_SLEEP_S, max(POLL_MIN_SLEEP_S, sleep_s * 1.4))
+        sleep_s = min(POLL_MAX_SLEEP_S, sleep_s * 1.4)
 
-    raise PvizAPIError(f"Polling timeout for job_id={job_id}")
+    raise PvizAPIError("Polling timeout")
 
-async def _get_artifact_url(api: PvizAPIAdapter, client: httpx.AsyncClient, job_id: str) -> Optional[str]:
-    """
-    Canonical artifact URL fetch:
-      - Prefer adapter.get_artifact_url_for_job() if present (newer adapter revision)
-      - Else call get_download_link() directly (legacy)
-    """
-    if hasattr(api, "get_artifact_url_for_job"):
-        try:
-            url = await api.get_artifact_url_for_job(client, job_id)  # type: ignore[attr-defined]
-            if isinstance(url, str) and url.strip():
-                return url.strip()
-        except Exception:
-            pass
-
-    dl = await api.get_download_link(client, job_id)
-    url = dl.get("url") or dl.get("s3_url")
-    if isinstance(url, str) and url.strip():
-        return url.strip()
-    return None
 
 # =============================================================================
 # MCP TOOLS
@@ -209,47 +233,47 @@ async def analyze_repository(
         questions=questions,
         github_token=github_token,
     )
+
     job_id = api.extract_job_id(submit)
 
     if not wait_for_completion:
-        return {"success": True, "status": "submitted", "job_id": job_id}
+        return {"success": True, "status": "submitted", "job_id": job_id, "repo_url": repo_url}
 
     status = await _wait_for_terminal(job_id)
-    state = api.get_job_status_value(status)
 
-    # Terminal failure envelopes
-    if state != "completed":
-        return {
-            "success": False,
-            "status": state,
-            "job_id": job_id,
-            "repo_url": status.get("repo_url") or repo_url,
-            "details": status,
-        }
+    raw_status = (status.get("status") or "").lower().strip()
+    normalized = (api.get_job_status_value(status) or "").lower().strip()
 
-    artifact_url = await _get_artifact_url(api, client, job_id)
+    # Decide success/failure using raw + normalized
+    is_completed = (raw_status == "completed") or (normalized == "completed")
+    if not is_completed:
+        return {"success": False, "status": raw_status or normalized or "unknown", "details": status}
+
+    # Your adapter correctly notes: status does NOT include a usable S3 url; fetch download link
+    download = await api.get_download_link(client, job_id)
+    s3_url = download.get("url") or download.get("s3_url")
 
     result: Dict[str, Any] = {
         "success": True,
         "status": "completed",
         "job_id": job_id,
-        "repo_url": status.get("repo_url") or repo_url,
-        "completed_at": status.get("completed_at"),
+        "repo_url": status.get("repo_url"),
+        "completed_at": status.get("completed_at") or datetime.utcnow().isoformat(),
         "tokens_charged": status.get("tokens_charged"),
-        "s3_url": artifact_url,
+        "s3_url": s3_url,
     }
 
-    if include_full_graph:
-        if not artifact_url:
-            raise PvizAPIError("Job completed but artifact URL is not available")
-        result["dependency_graph"] = await _download_json_streaming(artifact_url)
+    if include_full_graph and s3_url:
+        result["dependency_graph"] = await _download_json_streaming(s3_url)
 
     return result
+
 
 @mcp.tool()
 async def get_analysis_status(job_id: str) -> Dict[str, Any]:
     api = _adapter()
     return await api.get_job_status(_get_client(), job_id)
+
 
 @mcp.tool()
 async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> Dict[str, Any]:
@@ -257,18 +281,13 @@ async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> 
     client = _get_client()
 
     status = await api.get_job_status(client, job_id)
-    state = api.get_job_status_value(status)
+    raw_status = (status.get("status") or "").lower().strip()
 
-    if state != "completed":
-        return {
-            "success": False,
-            "status": state,
-            "job_id": job_id,
-            "message": f"Job is not completed (status={state}).",
-            "details": status,
-        }
+    if raw_status != "completed":
+        return {"success": False, "status": raw_status or "unknown", "details": status}
 
-    artifact_url = await _get_artifact_url(api, client, job_id)
+    download = await api.get_download_link(client, job_id)
+    s3_url = download.get("url") or download.get("s3_url")
 
     result: Dict[str, Any] = {
         "success": True,
@@ -277,22 +296,20 @@ async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> 
         "repo_url": status.get("repo_url"),
         "completed_at": status.get("completed_at"),
         "tokens_charged": status.get("tokens_charged"),
-        "s3_url": artifact_url,
+        "s3_url": s3_url,
     }
 
-    if include_full_graph:
-        if not artifact_url:
-            raise PvizAPIError("Artifact URL not available for this completed job")
-        result["dependency_graph"] = await _download_json_streaming(artifact_url)
+    if include_full_graph and s3_url:
+        result["dependency_graph"] = await _download_json_streaming(s3_url)
 
     return result
 
-# -----------------------------------------------------------------------------
-# Entrypoint (stdio/dev). For Docker HTTP deployment, run pviz_mcp_http.py
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# Entrypoint (stdio)
+# =============================================================================
 if __name__ == "__main__":
-    logger.info("Starting pviz MCP server (stdio/dev)")
-    logger.info(f"API endpoint: {API_BASE_URL}")
+    logger.info("Starting pviz MCP server (stdio)")
     try:
         mcp.run()
     finally:

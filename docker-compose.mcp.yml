@@ -1,183 +1,20 @@
-# docker-compose.yml snippet for pviz MCP Server
-#
-# Add this service to your existing docker-compose.yml
-#
-# Your existing services: api, worker, worker_llm, worker_llm_export, caddy
-# New service: pviz-mcp-server
-
 services:
-  # ... your existing services (api, worker, worker_llm, etc.) ...
-
-  # ============================================================================
-  # pviz MCP Server
-  # ============================================================================
   pviz-mcp-server:
     build:
-      context: ./mcp-server  # Path to MCP server code
+      context: .
       dockerfile: Dockerfile
-    
     restart: unless-stopped
-    
     environment:
-      # API connection
-      PVIZ_API_URL: http://api:8000  # Internal Docker network URL to your FastAPI
-      
-      # JWT token for MCP server to authenticate with your API
-      # Option 1: Use secrets (recommended)
+      PVIZ_API_URL: http://host.docker.internal:8000
       PVIZ_JWT_TOKEN_FILE: /run/secrets/mcp_jwt_token
-      
-      # Option 2: Use environment variable (less secure)
-      # PVIZ_JWT_TOKEN: ${MCP_JWT_TOKEN}
-      
-      # Server config
       PORT: 8080
       HOST: 0.0.0.0
       LOG_LEVEL: info
-      
-      # Optional: CORS for web clients
-      # CORS_ORIGINS: https://pvizgenerator.com,https://app.pvizgenerator.com
-    
-    # Use secrets for JWT token (recommended)
     secrets:
       - mcp_jwt_token
-    
-    # Health check
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    
-    # Internal network only (Caddy will expose it)
-    expose:
-      - "8080"
-    
-    # Optional: For local development/testing without Caddy
-    # ports:
-    #   - "8080:8080"
-    
-    # Depends on API being available
-    depends_on:
-      api:
-        condition: service_healthy
-    
-    # Logging
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
-        reservations:
-          cpus: '0.25'
-          memory: 256M
-
-  # ============================================================================
-  # Update Caddy to include MCP server
-  # ============================================================================
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./Caddyfile.mcp:/etc/caddy/Caddyfile.mcp:ro  # ADD: MCP config
-      - caddy_data:/data
-      - caddy_config:/config
-      - caddy_logs:/var/log/caddy  # ADD: For MCP logs
-    depends_on:
-      - api
-      - worker
-      - worker_llm
-      - worker_llm_export
-      - pviz-mcp-server  # ADD: MCP server dependency
+      - "8080:8080"
 
-# ============================================================================
-# Secrets (for JWT token)
-# ============================================================================
 secrets:
   mcp_jwt_token:
-    file: ./secrets/mcp_jwt_token.txt  # Create this file with your JWT token
-
-# ============================================================================
-# Volumes
-# ============================================================================
-volumes:
-  caddy_data:
-  caddy_config:
-  caddy_logs:  # ADD: For Caddy logs
-
-
-# ============================================================================
-# SETUP INSTRUCTIONS
-# ============================================================================
-#
-# 1. Create MCP server directory:
-#    mkdir -p mcp-server
-#    cp pviz_mcp_server.py mcp-server/
-#    cp api_adapter.py mcp-server/
-#    cp Dockerfile mcp-server/
-#    cp requirements.txt mcp-server/
-#
-# 2. Create secrets directory and add JWT token:
-#    mkdir -p secrets
-#    echo "your-jwt-token-here" > secrets/mcp_jwt_token.txt
-#    chmod 600 secrets/mcp_jwt_token.txt
-#
-# 3. Update your main Caddyfile:
-#    # Add this import at the top:
-#    import /etc/caddy/Caddyfile.mcp
-#
-# 4. Build and start:
-#    docker-compose build pviz-mcp-server
-#    docker-compose up -d pviz-mcp-server
-#
-# 5. Test:
-#    curl http://localhost:8080/health
-#    curl https://mcp.pvizgenerator.com/health
-#
-# 6. Check logs:
-#    docker-compose logs -f pviz-mcp-server
-
-
-# ============================================================================
-# ALTERNATIVE: Use existing API container's JWT generation
-# ============================================================================
-#
-# If your API can generate service tokens, you can use that instead:
-#
-# pviz-mcp-server:
-#   environment:
-#     # Use internal service-to-service auth
-#     PVIZ_SERVICE_TOKEN: ${SERVICE_TOKEN}
-#
-# Then update your API to accept service tokens for /auth/me, /tokens/overview, etc.
-
-
-# ============================================================================
-# NETWORK CONFIGURATION
-# ============================================================================
-#
-# By default, all services are on the same Docker network and can
-# communicate via service names (e.g., http://api:8000).
-#
-# If you have custom networks, add pviz-mcp-server to them:
-#
-# networks:
-#   backend:
-#   frontend:
-#
-# services:
-#   pviz-mcp-server:
-#     networks:
-#       - backend
-#       - frontend
+    file: ./secrets/mcp_jwt_token.txt

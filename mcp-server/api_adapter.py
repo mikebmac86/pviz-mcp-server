@@ -1,25 +1,29 @@
-"""
-API Adapter for pviz FastAPI Backend
-Configured for actual production endpoints based on TypeScript API client
-
-This adapter interfaces with:
-- /auth/me - Account information
-- /tokens/overview - Token balance
-- /estimate/github - Cost estimation
-- /jobs/github - Submit analysis
-- /jobs/{id} - Job status
-- /jobs - Job history
-- /jobs/{id}/download-link - Download results
-"""
-
-from __future__ import annotations
-
 import os
-import time
-from typing import Any, Dict, Optional, List
+from typing import Dict, Any, Optional, List
+import httpx
 from urllib.parse import urlparse
 
-import httpx
+
+def _read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _load_jwt_from_env() -> Optional[str]:
+    tok = os.getenv("PVIZ_JWT_TOKEN")
+    if tok and tok.strip():
+        return tok.strip()
+
+    tok_file = os.getenv("PVIZ_JWT_TOKEN_FILE")
+    if tok_file and tok_file.strip():
+        try:
+            raw = _read_text_file(tok_file.strip())
+            tok2 = (raw or "").strip()
+            if tok2:
+                return tok2
+        except Exception:
+            return None
+    return None
 
 
 class PvizAPIAdapter:
@@ -30,7 +34,12 @@ class PvizAPIAdapter:
 
     def __init__(self, base_url: str, jwt_token: str):
         self.base_url = base_url.rstrip("/")
-        self.jwt_token = jwt_token
+        tok = (jwt_token or "").strip()
+        if not tok:
+            env_tok = _load_jwt_from_env()
+            if env_tok:
+                tok = env_tok
+        self.jwt_token = tok
 
     # ------------------------------------------------------------------
     # Auth / headers
