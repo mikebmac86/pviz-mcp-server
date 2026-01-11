@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY pviz_mcp_server.py .
-COPY pviz_mcp_http.py .
 COPY api_adapter.py .
 
 # Environment variables (override these at runtime)
