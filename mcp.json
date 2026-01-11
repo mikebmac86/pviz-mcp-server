@@ -1,0 +1,191 @@
+{
+  "name": "pviz-dependency-analyzer",
+  "displayName": "pviz Dependency Analyzer",
+  "description": "Polyglot dependency analysis for codebases. Detects circular dependencies, extracts metrics, and visualizes architecture for JavaScript, TypeScript, and Python projects.",
+  "version": "1.0.0",
+  "author": {
+    "name": "pviz Team",
+    "url": "https://pvizgenerator.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/your-username/pviz-mcp-server",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/pviz-mcp-server"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/pviz-mcp-server/issues"
+  },
+  "categories": [
+    "development",
+    "code-analysis",
+    "architecture",
+    "dependencies"
+  ],
+  "tags": [
+    "dependency-analysis",
+    "circular-dependencies",
+    "code-metrics",
+    "javascript",
+    "typescript",
+    "python",
+    "architecture",
+    "polyglot"
+  ],
+  "capabilities": {
+    "tools": [
+      {
+        "name": "analyze_repository",
+        "description": "Analyze a Git repository for dependency structure and architecture",
+        "parameters": [
+          "repo_url",
+          "languages",
+          "wait_for_completion",
+          "include_full_graph"
+        ]
+      },
+      {
+        "name": "get_circular_dependencies",
+        "description": "Find circular dependency chains in a repository",
+        "parameters": [
+          "repo_url",
+          "wait_for_completion"
+        ]
+      },
+      {
+        "name": "get_repository_metrics",
+        "description": "Get high-level architecture metrics without downloading full graph",
+        "parameters": [
+          "repo_url",
+          "wait_for_completion"
+        ]
+      },
+      {
+        "name": "compare_repositories",
+        "description": "Compare architecture of two repositories side-by-side",
+        "parameters": [
+          "repo_url_1",
+          "repo_url_2",
+          "wait_for_completion"
+        ]
+      },
+      {
+        "name": "get_analysis_status",
+        "description": "Check the status of a running analysis job",
+        "parameters": [
+          "job_id"
+        ]
+      },
+      {
+        "name": "download_dependency_graph",
+        "description": "Download the complete dependency graph from S3",
+        "parameters": [
+          "s3_url"
+        ]
+      }
+    ],
+    "resources": [
+      {
+        "uri": "pviz://schema",
+        "name": "pviz Schema Documentation",
+        "description": "Documentation of the pviz dependency graph JSON schema"
+      },
+      {
+        "uri": "pviz://examples",
+        "name": "Example Analysis Results",
+        "description": "Sample dependency analysis outputs for reference"
+      }
+    ],
+    "prompts": [
+      {
+        "name": "analyze_codebase_prompt",
+        "description": "Template for analyzing a codebase's architecture",
+        "arguments": [
+          "repo_url"
+        ]
+      },
+      {
+        "name": "compare_projects_prompt",
+        "description": "Template for comparing two projects",
+        "arguments": [
+          "repo_url_1",
+          "repo_url_2"
+        ]
+      }
+    ]
+  },
+  "installation": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "pviz_mcp_server.py"
+    ],
+    "env": {
+      "PVIZ_JWT_TOKEN": {
+        "required": true,
+        "description": "JWT token for api.pvizgenerator.com authentication",
+        "secret": true
+      },
+      "PVIZ_API_URL": {
+        "required": false,
+        "description": "Base URL for pviz API",
+        "default": "https://api.pvizgenerator.com"
+      }
+    }
+  },
+  "http": {
+    "enabled": true,
+    "endpoint": "/mcp",
+    "health_check": "/health",
+    "deployment": {
+      "docker": true,
+      "serverless": true,
+      "platforms": [
+        "AWS Lambda",
+        "Google Cloud Run",
+        "Azure Functions",
+        "Fly.io"
+      ]
+    }
+  },
+  "languages": [
+    "JavaScript",
+    "TypeScript",
+    "Python"
+  ],
+  "requirements": {
+    "python": ">=3.8",
+    "dependencies": [
+      "mcp>=1.0.0",
+      "httpx>=0.27.0",
+      "starlette>=0.37.0",
+      "uvicorn>=0.29.0"
+    ]
+  },
+  "pricing": {
+    "model": "usage-based",
+    "description": "Requires pvizgenerator.com account with credits. Free MCP server, pay for analysis API calls.",
+    "free_tier": "Available with pvizgenerator.com free tier",
+    "url": "https://pvizgenerator.com/pricing"
+  },
+  "examples": [
+    {
+      "query": "Analyze https://github.com/django/django and tell me about its architecture",
+      "description": "Analyze Django's codebase architecture"
+    },
+    {
+      "query": "Does https://github.com/facebook/react have circular dependencies?",
+      "description": "Check React for circular dependencies"
+    },
+    {
+      "query": "Compare the architecture of Vue.js and React",
+      "description": "Side-by-side comparison of two frameworks"
+    }
+  ],
+  "documentation": {
+    "readme": "README.md",
+    "setup": "SETUP.md",
+    "api": "docs/API_ENDPOINTS.md",
+    "troubleshooting": "docs/TROUBLESHOOTING.md"
+  }
+}
