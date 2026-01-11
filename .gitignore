@@ -41,12 +41,17 @@ env/
 .env.*.local
 
 # Secrets - NEVER commit these!
-**/jwt_token*
-**/api_key*
-**/*secret*
-**/*token*
+# Be specific to avoid blocking legitimate files
+secrets/*.txt
+secrets/*.key
+secrets/*.pem
+secrets/mcp_jwt_token.txt
+*_jwt_token.txt
+api_key.txt
 *.pem
 *.key
+private.key
+service-account.json
 
 # Logs
 *.log
