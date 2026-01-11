@@ -65,6 +65,53 @@ class PvizAPIError(Exception):
 
 
 # -----------------------------------------------------------------------------
+# Private Repo Detection
+# -----------------------------------------------------------------------------
+async def _handle_private_repo_error(error_detail: str, status_code: int) -> Optional[Dict[str, Any]]:
+    """
+    Detect if error indicates private repo and return helpful response.
+    
+    Returns None if not a private repo error, otherwise returns error dict.
+    """
+    # Common patterns in API errors for private repos
+    private_indicators = [
+        "not found",
+        "repository not found",
+        "could not find",
+        "does not exist",
+        "authentication required",
+        "private",
+        "access denied",
+        "permission denied",
+    ]
+    
+    detail_lower = (error_detail or "").lower()
+    is_private = (status_code in (400, 404)) and any(indicator in detail_lower for indicator in private_indicators)
+    
+    if is_private:
+        return {
+            "success": False,
+            "error": "private_repository",
+            "message": (
+                "This repository appears to be private or does not exist.\n\n"
+                "To analyze private repositories, you need to provide a GitHub Personal Access Token (PAT).\n\n"
+                "To create a PAT:\n"
+                "1. Go to GitHub Settings → Developer Settings → Personal Access Tokens → Tokens (classic)\n"
+                "2. Click 'Generate new token (classic)'\n"
+                "3. Give it a descriptive name (e.g., 'Pviz Analysis')\n"
+                "4. Select the 'repo' scope for full repository access\n"
+                "5. Click 'Generate token' and copy it immediately\n"
+                "6. Call this function again with the github_token parameter\n\n"
+                "Example: analyze_repository(repo_url='owner/repo', github_token='ghp_your_token_here')"
+            ),
+            "requires_github_token": True,
+            "help_url": "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token",
+        }
+    
+    return None
+
+
+# -----------------------------------------------------------------------------
 # JWT loading (ENV or FILE)
 # -----------------------------------------------------------------------------
 def _read_text_file(path: str) -> str:
@@ -278,7 +325,7 @@ async def estimate_cost(
     
     Args:
         repo_url: GitHub repository URL or "owner/repo" format
-        github_token: Optional GitHub token for private repos
+        github_token: Optional GitHub token for private repos (required for private repositories)
         
     Returns:
         Dict containing:
@@ -286,11 +333,34 @@ async def estimate_cost(
         - sloc: Source lines of code
         - file_count: Number of files
         - can_afford: Whether user has sufficient balance
+        
+        OR if repository is private and no token provided:
+        - success: False
+        - error: "private_repository"
+        - message: Instructions for creating GitHub PAT
+        - requires_github_token: True
     """
     repo_url = _normalize_repo_url(repo_url)
     api = _adapter()
     client = _get_client()
-    return await api.estimate_cost(client, repo_url, github_token)
+    
+    try:
+        return await api.estimate_cost(client, repo_url, github_token)
+    except httpx.HTTPStatusError as e:
+        # Check if this is a private repo error
+        detail = str(e)
+        try:
+            error_body = e.response.json()
+            detail = error_body.get("detail", detail)
+        except Exception:
+            pass
+        
+        private_error = await _handle_private_repo_error(detail, e.response.status_code)
+        if private_error:
+            return private_error
+        
+        # Re-raise if not a private repo error
+        raise
 
 
 # =============================================================================
@@ -341,22 +411,44 @@ async def analyze_repository(
         include_full_graph: If True, include full dependency graph in response
         pricing_choice: Payment method ("tokens" or "trial_credit")
         questions: Optional list of analysis questions
-        github_token: Optional GitHub token for private repos
+        github_token: Optional GitHub token for private repos (required for private repositories)
         
     Returns:
         Dict containing analysis results or job status
+        
+        OR if repository is private and no token provided:
+        - success: False
+        - error: "private_repository"
+        - message: Instructions for creating GitHub PAT
+        - requires_github_token: True
     """
     repo_url = _normalize_repo_url(repo_url)
     api = _adapter()
     client = _get_client()
 
-    submit = await api.submit_analysis(
-        client,
-        repo_url=repo_url,
-        pricing_choice=pricing_choice,
-        questions=questions,
-        github_token=github_token,
-    )
+    try:
+        submit = await api.submit_analysis(
+            client,
+            repo_url=repo_url,
+            pricing_choice=pricing_choice,
+            questions=questions,
+            github_token=github_token,
+        )
+    except httpx.HTTPStatusError as e:
+        # Check if this is a private repo error
+        detail = str(e)
+        try:
+            error_body = e.response.json()
+            detail = error_body.get("detail", detail)
+        except Exception:
+            pass
+        
+        private_error = await _handle_private_repo_error(detail, e.response.status_code)
+        if private_error:
+            return private_error
+        
+        # Re-raise if not a private repo error
+        raise
 
     job_id = api.extract_job_id(submit)
 
