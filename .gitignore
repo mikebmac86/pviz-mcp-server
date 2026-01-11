@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Secrets - NEVER commit these!
+**/jwt_token*
+**/api_key*
+**/*secret*
+**/*token*
+*.pem
+*.key
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Docker
+.dockerignore
+
+# MCP specific
+# (Keep example files but ignore local configs)
+claude_desktop_config.json
+mcp_config.json
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# OS files
+Thumbs.db
+.DS_Store

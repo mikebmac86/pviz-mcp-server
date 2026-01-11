@@ -1,0 +1,101 @@
+# Caddyfile for pviz MCP Server
+#
+# Add this to your existing Caddyfile to expose the MCP server
+#
+# ============================================================================
+# Option 1: Separate subdomain (RECOMMENDED)
+# ============================================================================
+# Access: https://mcp.pvizgenerator.com
+
+mcp.pvizgenerator.com {
+    # Automatic HTTPS via Let's Encrypt (Caddy handles this!)
+    
+    # Logging
+    log {
+        output file /var/log/caddy/mcp-access.log
+        format json
+    }
+
+    # MCP endpoint
+    handle /mcp {
+        reverse_proxy pviz-mcp-server:8080 {
+            # Timeouts for long-running analysis
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 300s
+                read_timeout 300s
+                write_timeout 300s
+            }
+            
+            # Health checks
+            health_uri /health
+            health_interval 30s
+            health_timeout 10s
+        }
+    }
+
+    # Health check endpoint
+    handle /health {
+        reverse_proxy pviz-mcp-server:8080
+    }
+
+    # Info endpoint
+    handle / {
+        reverse_proxy pviz-mcp-server:8080
+    }
+
+    # CORS headers (if needed for web clients)
+    header {
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers "Authorization, Content-Type"
+        
+        # Security headers
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "no-referrer-when-downgrade"
+    }
+
+    # Rate limiting (requires Caddy rate-limit module)
+    # Uncomment if you have the module installed
+    # rate_limit {
+    #     zone mcp {
+    #         key {remote_host}
+    #         events 10
+    #         window 1m
+    #     }
+    # }
+}
+
+
+# ============================================================================
+# Option 2: Add to existing domain as /mcp path
+# ============================================================================
+# Access: https://api.pvizgenerator.com/mcp
+# Add this to your existing api.pvizgenerator.com block
+
+# api.pvizgenerator.com {
+#     # ... your existing API handlers ...
+# 
+#     # MCP endpoints
+#     handle /mcp* {
+#         reverse_proxy pviz-mcp-server:8080 {
+#             transport http {
+#                 response_header_timeout 300s
+#                 read_timeout 300s
+#             }
+#         }
+#     }
+# }
+
+
+# ============================================================================
+# Option 3: Simple local development (no SSL)
+# ============================================================================
+# Access: http://localhost:8080 (direct to container)
+# No Caddy config needed - just expose the port in docker-compose.yml
+
+# pviz-mcp-server:
+#   ports:
+#     - "8080:8080"
