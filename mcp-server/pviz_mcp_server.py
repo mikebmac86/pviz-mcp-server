@@ -210,7 +210,117 @@ async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# MCP TOOLS
+# MCP TOOLS - ACCOUNT & BALANCE
+# =============================================================================
+
+@mcp.tool()
+async def get_account_info() -> Dict[str, Any]:
+    """
+    Get account information including email, plan, and verification status.
+    
+    Returns:
+        Account details from the API
+    """
+    api = _adapter()
+    client = _get_client()
+    return await api.get_account_info(client)
+
+
+@mcp.tool()
+async def get_token_balance() -> Dict[str, Any]:
+    """
+    Get current token balance and account overview.
+    
+    Returns:
+        Dict containing:
+        - balance: Current token balance
+        - plan: Account plan (free, pro, etc.)
+        - trial: Trial information if applicable
+        - products: Available products
+        - full_overview: Complete overview data
+    """
+    api = _adapter()
+    client = _get_client()
+    return await api.get_token_balance(client)
+
+
+@mcp.tool()
+async def check_sufficient_balance(required_tokens: int) -> Dict[str, Any]:
+    """
+    Check if user has sufficient token balance for an operation.
+    
+    Args:
+        required_tokens: Number of tokens required
+        
+    Returns:
+        Dict containing:
+        - can_afford: Boolean indicating if balance is sufficient
+        - current_balance: Current token balance
+        - required: Required tokens
+        - shortfall: Token shortfall if insufficient (only if can_afford is False)
+    """
+    api = _adapter()
+    client = _get_client()
+    return await api.check_sufficient_balance(client, required_tokens)
+
+
+# =============================================================================
+# MCP TOOLS - COST ESTIMATION
+# =============================================================================
+
+@mcp.tool()
+async def estimate_cost(
+    repo_url: str,
+    github_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Estimate the cost (in tokens) for analyzing a repository before submitting.
+    
+    Args:
+        repo_url: GitHub repository URL or "owner/repo" format
+        github_token: Optional GitHub token for private repos
+        
+    Returns:
+        Dict containing:
+        - tokens_needed: Estimated tokens required
+        - sloc: Source lines of code
+        - file_count: Number of files
+        - can_afford: Whether user has sufficient balance
+    """
+    repo_url = _normalize_repo_url(repo_url)
+    api = _adapter()
+    client = _get_client()
+    return await api.estimate_cost(client, repo_url, github_token)
+
+
+# =============================================================================
+# MCP TOOLS - JOB HISTORY
+# =============================================================================
+
+@mcp.tool()
+async def get_job_history(
+    limit: int = 10,
+    skip: int = 0,
+) -> Dict[str, Any]:
+    """
+    Get recent job history with pagination.
+    
+    Args:
+        limit: Maximum number of jobs to return (1-50, default 10)
+        skip: Number of jobs to skip for pagination (default 0)
+        
+    Returns:
+        Dict containing:
+        - total: Total number of jobs
+        - jobs: List of job objects
+    """
+    api = _adapter()
+    client = _get_client()
+    return await api.get_job_history(client, limit, skip)
+
+
+# =============================================================================
+# MCP TOOLS - REPOSITORY ANALYSIS
 # =============================================================================
 
 @mcp.tool()
@@ -222,6 +332,20 @@ async def analyze_repository(
     questions: Optional[List[str]] = None,
     github_token: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Submit a repository for dependency analysis.
+    
+    Args:
+        repo_url: GitHub repository URL or "owner/repo" format
+        wait_for_completion: If True, wait for analysis to complete
+        include_full_graph: If True, include full dependency graph in response
+        pricing_choice: Payment method ("tokens" or "trial_credit")
+        questions: Optional list of analysis questions
+        github_token: Optional GitHub token for private repos
+        
+    Returns:
+        Dict containing analysis results or job status
+    """
     repo_url = _normalize_repo_url(repo_url)
     api = _adapter()
     client = _get_client()
@@ -271,12 +395,31 @@ async def analyze_repository(
 
 @mcp.tool()
 async def get_analysis_status(job_id: str) -> Dict[str, Any]:
+    """
+    Get the current status of an analysis job.
+    
+    Args:
+        job_id: Job ID to check
+        
+    Returns:
+        Job status information
+    """
     api = _adapter()
     return await api.get_job_status(_get_client(), job_id)
 
 
 @mcp.tool()
 async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> Dict[str, Any]:
+    """
+    Retrieve results from a completed analysis job.
+    
+    Args:
+        job_id: Job ID to retrieve
+        include_full_graph: If True, include full dependency graph
+        
+    Returns:
+        Analysis results if job is completed
+    """
     api = _adapter()
     client = _get_client()
 
