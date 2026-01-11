@@ -22,8 +22,7 @@ LLM (Claude) → MCP Server → api.pvizgenerator.com → S3 → Dependency Grap
 
 | File | Purpose |
 |------|---------|
-| `pviz_mcp_server.py` | Main MCP server (STDIO mode for local use) |
-| `pviz_mcp_http.py` | HTTP wrapper for cloud deployment |
+| `pviz_mcp_server.py` | Main MCP server |
 | `api_adapter.py` | Configure to match your actual API endpoints |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile` | Container image for deployment |

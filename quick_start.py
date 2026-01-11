@@ -166,7 +166,6 @@ def show_next_steps():
     print("   This runs in STDIO mode for Claude Desktop")
     
     print("\n3️⃣  Or Start HTTP Server:")
-    print("   python pviz_mcp_http.py")
     print("   Then visit: http://localhost:8080/")
     print("   Health check: http://localhost:8080/health")
     

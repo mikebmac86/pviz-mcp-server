@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY pviz_mcp_server.py .
 COPY api_adapter.py .
 
-# Environment variables (override these at runtime)
+# Environment variables (override at runtime)
 ENV PORT=8080
 ENV HOST=0.0.0.0
 ENV PVIZ_API_URL=https://api.pvizgenerator.com
@@ -26,9 +26,9 @@ ENV LOG_LEVEL=info
 # Expose port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+# Health check (only works once server is ASGI-exposed)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the HTTP server
-CMD ["python", "pviz_mcp_http.py"]
+# Run FastMCP via ASGI
+CMD ["uvicorn", "pviz_mcp_server:mcp", "--host", "0.0.0.0", "--port", "8080"]

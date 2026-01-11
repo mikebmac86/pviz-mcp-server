@@ -7,7 +7,6 @@ Copyright (c) 2026 Kaybaum Solutions
 This license applies ONLY to the MCP (Model Context Protocol) server code in this 
 repository, specifically:
 - pviz_mcp_server.py
-- pviz_mcp_http.py
 - api_adapter.py
 - Related MCP server configuration and documentation files
 

@@ -20,9 +20,6 @@ export PVIZ_API_URL="https://api.pvizgenerator.com"
 ```bash
 # Run in STDIO mode (for Claude Desktop integration)
 python pviz_mcp_server.py
-
-# OR run in HTTP mode (for cloud/remote access)
-python pviz_mcp_http.py
 ```
 
 ---
@@ -78,12 +75,12 @@ Try asking Claude:
 ```bash
 # Create deployment package
 pip install -r requirements.txt -t package/
-cp pviz_mcp_server.py pviz_mcp_http.py package/
+cp pviz_mcp_server.py package/
 
 cd package
 zip -r ../pviz-mcp-lambda.zip .
 cd ..
-zip -g pviz-mcp-lambda.zip pviz_mcp_server.py pviz_mcp_http.py
+zip -g pviz-mcp-lambda.zip pviz_mcp_server.py
 ```
 
 2. **Deploy to Lambda**
@@ -289,13 +286,6 @@ aws logs tail /ecs/pviz-mcp-server --follow
 gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=pviz-mcp-server" --limit 50 --format json
 ```
 
-### Local Development
-
-```bash
-# Logs go to stderr by default
-python pviz_mcp_http.py 2>&1 | tee server.log
-```
-
 ---
 
 ## Security Best Practices
@@ -314,26 +304,7 @@ aws secretsmanager create-secret \
 echo -n "your-jwt-token" | gcloud secrets create pviz-jwt-token --data-file=-
 ```
 
-### 2. Add API Key Authentication (Optional)
-
-Modify `pviz_mcp_http.py`:
-
-```python
-from starlette.middleware import Middleware
-from starlette.middleware.authentication import AuthenticationMiddleware
-
-async def verify_api_key(conn):
-    api_key = conn.headers.get("X-API-Key")
-    if api_key != os.getenv("MCP_API_KEY"):
-        raise AuthenticationError("Invalid API key")
-
-app.add_middleware(
-    AuthenticationMiddleware,
-    backend=verify_api_key
-)
-```
-
-### 3. Enable HTTPS Only
+### 2. Enable HTTPS Only
 
 All cloud platforms (AWS, GCP, Fly.io) provide HTTPS by default. Never expose HTTP in production.
 
