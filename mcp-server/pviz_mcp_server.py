@@ -235,6 +235,9 @@ async def retrieve_past_result(
 
     return result
 
+# Expose ASGI app for uvicorn
+app = mcp.asgi_app()
+
 # =============================================================================
 # Entrypoint
 # =============================================================================
