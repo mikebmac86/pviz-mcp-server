@@ -26,6 +26,7 @@ cd /path/to/your/project
 mkdir -p mcp-server
 cp api_adapter.py mcp-server/
 cp pviz_mcp_server.py mcp-server/
+cp pviz_mcp_http.py mcp-server/
 cp requirements.txt mcp-server/
 cp Dockerfile mcp-server/
 ```
@@ -181,7 +182,8 @@ your-project/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── api_adapter.py
-│   └── pviz_mcp_server.py
+│   ├── pviz_mcp_server.py
+│   └── pviz_mcp_http.py
 ├── api/                        # Existing
 ├── workers/                    # Existing
 └── ...

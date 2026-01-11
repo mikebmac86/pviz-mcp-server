@@ -304,7 +304,26 @@ aws secretsmanager create-secret \
 echo -n "your-jwt-token" | gcloud secrets create pviz-jwt-token --data-file=-
 ```
 
-### 2. Enable HTTPS Only
+### 2. Add API Key Authentication (Optional)
+
+Modify `pviz_mcp_http.py`:
+
+```python
+from starlette.middleware import Middleware
+from starlette.middleware.authentication import AuthenticationMiddleware
+
+async def verify_api_key(conn):
+    api_key = conn.headers.get("X-API-Key")
+    if api_key != os.getenv("MCP_API_KEY"):
+        raise AuthenticationError("Invalid API key")
+
+app.add_middleware(
+    AuthenticationMiddleware,
+    backend=verify_api_key
+)
+```
+
+### 3. Enable HTTPS Only
 
 All cloud platforms (AWS, GCP, Fly.io) provide HTTPS by default. Never expose HTTP in production.
 

@@ -294,7 +294,7 @@ ERROR: failed to solve: failed to compute cache key
 **Make sure all files are present:**
 ```bash
 # Check required files exist
-ls -la pviz_mcp_server.py api_adapter.py requirements.txt Dockerfile
+ls -la pviz_mcp_server.py pviz_mcp_http.py api_adapter.py requirements.txt Dockerfile
 ```
 
 **Build with no cache:**
@@ -317,6 +317,13 @@ docker run pviz-mcp
 **Check logs:**
 ```bash
 docker logs <container-id>
+```
+
+**Run interactively:**
+```bash
+docker run -it pviz-mcp /bin/bash
+# Then manually run:
+python pviz_mcp_http.py
 ```
 
 **Check environment variables:**
