@@ -1,8 +1,10 @@
 """
-pviz MCP Server - Production Version
-Integrates with existing FastAPI backend at api.pvizgenerator.com
+pviz MCP Server - Local MCP (Production API Backend)
 
-This server exposes pviz's dependency analysis capabilities to LLMs via MCP protocol.
+This MCP server runs locally (stdio) and integrates with the existing FastAPI
+backend at api.pvizgenerator.com.
+
+It exposes PViz's dependency analysis capabilities to LLMs via the MCP protocol.
 """
 
 from __future__ import annotations
@@ -12,8 +14,7 @@ import asyncio
 import httpx
 import random
 import logging
-import hashlib
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -127,61 +128,17 @@ async def _handle_private_repo_error(error_detail: str, status_code: int) -> Opt
 
 
 # -----------------------------------------------------------------------------
-# JWT loading (ENV or FILE) + non-sensitive debug fingerprint
+# Adapter factory
 # -----------------------------------------------------------------------------
-def _read_text_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def _token_fingerprint(tok: str) -> str:
-    """
-    Non-sensitive token fingerprint for debugging.
-    DOES NOT log the full token.
-    """
-    t = (tok or "").strip()
-    if not t:
-        return "empty"
-    h = hashlib.sha256(t.encode("utf-8")).hexdigest()[:12]
-    return f"sha256[:12]={h} len={len(t)} head={t[:6]!r} tail={t[-6:]!r}"
-
-
-def load_jwt_token_with_source() -> Tuple[str, str]:
-    """
-    Load JWT token from:
-      1) PVIZ_JWT_TOKEN (direct env)
-      2) PVIZ_JWT_TOKEN_FILE (docker secret file path)
-
-    Returns: (token, source) where source is 'env' or 'file'
-    """
-    tok = os.getenv("PVIZ_JWT_TOKEN")
-    if tok and tok.strip():
-        return tok.strip(), "env"
-
-    tok_file = os.getenv("PVIZ_JWT_TOKEN_FILE")
-    if tok_file and tok_file.strip():
-        try:
-            raw = _read_text_file(tok_file.strip())
-            tok2 = (raw or "").strip()
-            if tok2:
-                return tok2, "file"
-        except FileNotFoundError as e:
-            raise PvizAPIError(f"PVIZ_JWT_TOKEN_FILE points to missing file: {tok_file!r}") from e
-        except Exception as e:
-            raise PvizAPIError(f"Failed to read PVIZ_JWT_TOKEN_FILE={tok_file!r}: {e}") from e
-
-    raise PvizAPIError("JWT not configured: set PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE")
-
-
-def load_jwt_token() -> str:
-    tok, _src = load_jwt_token_with_source()
-    return tok
-
-
 def _adapter() -> PvizAPIAdapter:
-    # Create adapter per call so it always pulls the latest token from env/file.
-    # Adapter itself will do no-cache + cb cache busting on identity endpoints.
-    return PvizAPIAdapter(API_BASE_URL, load_jwt_token())
+    """
+    Create adapter per call so it always pulls the latest token from env/file.
+
+    NOTE:
+    - PvizAPIAdapter is the single source of truth for JWT loading (env/file).
+    - This module intentionally does NOT implement a parallel JWT loader.
+    """
+    return PvizAPIAdapter(API_BASE_URL)
 
 
 # -----------------------------------------------------------------------------
@@ -265,25 +222,6 @@ def _normalize_repo_url(repo_url: str) -> str:
     return repo_url
 
 
-def _coerce_int(v: Any, default: int = 0) -> int:
-    try:
-        if v is None:
-            return default
-        if isinstance(v, bool):
-            return int(v)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, float):
-            return int(v)
-        if isinstance(v, str):
-            s = v.strip()
-            if s.isdigit():
-                return int(s)
-    except Exception:
-        pass
-    return default
-
-
 async def _download_json_streaming(url: str) -> Dict[str, Any]:
     client = _get_client()
     total = 0
@@ -328,6 +266,26 @@ async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
     raise PvizAPIError("Polling timeout")
 
 
+def _pick_artifact_url(artifact_formats: Dict[str, Any], *, prefer: str) -> Optional[str]:
+    """
+    prefer: "standard" | "compressed"
+    artifact_formats shape:
+      {
+        "standard": {"url": ...},
+        "compressed": {"url": ...} | None
+      }
+    """
+    if not isinstance(artifact_formats, dict):
+        return None
+
+    std = artifact_formats.get("standard") if isinstance(artifact_formats.get("standard"), dict) else None
+    cmp_ = artifact_formats.get("compressed") if isinstance(artifact_formats.get("compressed"), dict) else None
+
+    if prefer == "compressed":
+        return (cmp_ or {}).get("url") or (std or {}).get("url")
+    return (std or {}).get("url") or (cmp_ or {}).get("url")
+
+
 # =============================================================================
 # MCP TOOLS - CACHE / DEBUG
 # =============================================================================
@@ -350,13 +308,13 @@ async def debug_auth_fingerprint() -> Dict[str, Any]:
     """
     Non-sensitive debug info to confirm which JWT and API base URL the MCP server is using.
     Helps catch env-vs-file token drift and wrong environment issues.
+
+    NOTE: Token sourcing & fingerprinting are provided by PvizAPIAdapter.
     """
-    tok, src = load_jwt_token_with_source()
+    api = _adapter()
     return {
         "success": True,
-        "api_base_url": API_BASE_URL,
-        "token_source": src,
-        "token_fingerprint": _token_fingerprint(tok),
+        "adapter_debug": api.debug_token_info(),
         "no_cache_headers_enabled": NO_CACHE_DEFAULT,
         "force_fresh_identity_enabled": FORCE_FRESH_IDENTITY,
         "cache_buster_enabled": CACHE_BUSTER_DEFAULT,
@@ -389,7 +347,6 @@ async def billing_diagnostics(limit_transactions: int = 20) -> Dict[str, Any]:
             force_fresh=True,
         )
 
-        # Basic consistency check (doesn't assert correctness, just flags mismatch)
         bal_current = bal.get("current_balance") if isinstance(bal, dict) else None
         ov_current = ov.get("balance") if isinstance(ov, dict) else None
 
@@ -567,9 +524,16 @@ async def analyze_repository(
     pricing_choice: str = "tokens",
     questions: Optional[List[str]] = None,
     github_token: Optional[str] = None,
+    prefer_artifact: str = "compressed",  # "standard" | "compressed"
 ) -> Dict[str, Any]:
     """
     Submit a repository for dependency analysis.
+
+    NOTE:
+      - Legacy /download-link shim is removed.
+      - Artifacts are resolved via:
+          (A) GET /jobs/{id} -> artifact_formats
+          (B) GET /jobs/{id}/artifact-links?prefer=...
     """
     repo_url = _normalize_repo_url(repo_url)
     api = _adapter()
@@ -611,8 +575,10 @@ async def analyze_repository(
     if not is_completed:
         return {"success": False, "status": raw_status or normalized or "unknown", "details": status}
 
-    download = await api.get_download_link(client, job_id)
-    s3_url = download.get("url") or download.get("s3_url")
+    artifacts = await api.get_job_artifacts(client, job_id, prefer="both", force_fresh=True)
+    artifact_formats = artifacts.get("artifact_formats") if isinstance(artifacts, dict) else None
+
+    preferred_url = _pick_artifact_url(artifact_formats or {}, prefer=prefer_artifact)
 
     result: Dict[str, Any] = {
         "success": True,
@@ -621,11 +587,13 @@ async def analyze_repository(
         "repo_url": status.get("repo_url"),
         "completed_at": status.get("completed_at") or datetime.utcnow().isoformat(),
         "tokens_charged": status.get("tokens_charged"),
-        "s3_url": s3_url,
+        "artifact_formats": artifact_formats,
+        "artifact_url": preferred_url,
+        "artifact_source": artifacts.get("source") if isinstance(artifacts, dict) else None,
     }
 
-    if include_full_graph and s3_url:
-        result["dependency_graph"] = await _download_json_streaming(s3_url)
+    if include_full_graph and preferred_url:
+        result["dependency_graph"] = await _download_json_streaming(preferred_url)
 
     return result
 
@@ -640,9 +608,19 @@ async def get_analysis_status(job_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> Dict[str, Any]:
+async def retrieve_past_result(
+    job_id: str,
+    include_full_graph: bool = True,
+    prefer_artifact: str = "compressed",  # "standard" | "compressed"
+) -> Dict[str, Any]:
     """
     Retrieve results from a completed analysis job.
+
+    NOTE:
+      - Legacy /download-link shim is removed.
+      - Artifacts are resolved via:
+          (A) GET /jobs/{id} -> artifact_formats
+          (B) GET /jobs/{id}/artifact-links?prefer=...
     """
     api = _adapter()
     client = _get_client()
@@ -653,8 +631,10 @@ async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> 
     if raw_status != "completed":
         return {"success": False, "status": raw_status or "unknown", "details": status}
 
-    download = await api.get_download_link(client, job_id, force_fresh=True)
-    s3_url = download.get("url") or download.get("s3_url")
+    artifacts = await api.get_job_artifacts(client, job_id, prefer="both", force_fresh=True)
+    artifact_formats = artifacts.get("artifact_formats") if isinstance(artifacts, dict) else None
+
+    preferred_url = _pick_artifact_url(artifact_formats or {}, prefer=prefer_artifact)
 
     result: Dict[str, Any] = {
         "success": True,
@@ -663,11 +643,13 @@ async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> 
         "repo_url": status.get("repo_url"),
         "completed_at": status.get("completed_at"),
         "tokens_charged": status.get("tokens_charged"),
-        "s3_url": s3_url,
+        "artifact_formats": artifact_formats,
+        "artifact_url": preferred_url,
+        "artifact_source": artifacts.get("source") if isinstance(artifacts, dict) else None,
     }
 
-    if include_full_graph and s3_url:
-        result["dependency_graph"] = await _download_json_streaming(s3_url)
+    if include_full_graph and preferred_url:
+        result["dependency_graph"] = await _download_json_streaming(preferred_url)
 
     return result
 
@@ -676,16 +658,17 @@ async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> 
 # Entrypoint (stdio)
 # =============================================================================
 if __name__ == "__main__":
-    logger.info("Starting pviz MCP server (stdio)")
+    logger.info("Starting pviz MCP server (stdio/local)")
     try:
         # Helpful one-time startup log (non-sensitive)
         try:
-            tok, src = load_jwt_token_with_source()
+            api = _adapter()
+            dbg = api.debug_token_info()
             logger.info(
                 "MCP config: api_base=%s token_source=%s token_fp=%s no_cache=%s force_fresh_identity=%s cache_buster=%s",
-                API_BASE_URL,
-                src,
-                _token_fingerprint(tok),
+                dbg.get("base_url"),
+                dbg.get("token_source"),
+                dbg.get("token_fingerprint"),
                 NO_CACHE_DEFAULT,
                 FORCE_FRESH_IDENTITY,
                 CACHE_BUSTER_DEFAULT,

@@ -218,7 +218,7 @@
     "rate_limits": {
       "cost_estimation": "10 per 5 minutes",
       "job_submission": "20 per hour",
-      "download_links": "10 per minute"
+      "artifact_links": "10 per minute"
     }
   },
   "pricing": {
