@@ -645,7 +645,7 @@ class PvizAPIAdapter:
                 if prefer == "standard":
                     af = {"standard": af.get("standard"), "compressed": None}
                 elif prefer == "compressed":
-                    af = {"standard": af.get("standard"), "compressed": af.get("compressed")}
+                    af = {"standard": None, "compressed": af.get("compressed")}
                 return {
                     "job_id": job_id,
                     "status": job.get("status"),
