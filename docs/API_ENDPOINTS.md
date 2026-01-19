@@ -616,40 +616,304 @@ Analysis artifacts follow the `pviz-llm-bundle@v1.1` schema, optimized for LLM i
 
 ### Field Definitions
 
-#### metadata
+#### Schema Structure
+
+The artifact uses a **schema-encoded format** where field names are abbreviated and stored in a legend. This reduces size by ~50-60% while remaining lossless.
+```json
+{
+  "schema_version": "pviz-llm-bundle@v1.1",
+  "meta": {...},
+  "nodes": {
+    "schema": ["f", "n", "lang", ...],    // Abbreviated field names
+    "legend": {"f": "file", "n": "name", ...},  // Field mappings
+    "enums": {...},                        // Enum value mappings
+    "type_strings": [...],                 // Deduplicated type hints
+    "rows": {...}                          // Actual node data
+  },
+  "edges": [...],
+  "node_order": [...],
+  "summary": {...},
+  "discovery": {...},
+  "discovery_manifest": {...}
+}
+```
+
+---
+
+#### meta (Top-level metadata)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `repo_url` | string | Source repository URL |
-| `commit_sha` | string | Git commit analyzed |
-| `analyzed_at` | ISO8601 | Analysis timestamp |
-| `pviz_version` | string | Schema version |
-| `languages` | array | Programming languages detected |
-| `total_files` | integer | Number of source files |
+| `generated_at` | ISO8601 | Analysis timestamp |
+| `mode` | string | Analysis mode ("zones", "full", etc.) |
+| `language` | string | Primary or "polyglot" for multi-language |
+| `languages` | array | All languages detected (e.g., ["python", "typescript"]) |
+| `bundled_by_lang` | object | File count per language |
+| `repo_root` | string | Local analysis path |
+| `repo_name` | string | Repository identifier |
+| `edges_meta` | object | Edge schema info and statistics |
+
+**Example:**
+```json
+{
+  "generated_at": "2026-01-18T07:15:28.821381Z",
+  "mode": "zones",
+  "language": "polyglot",
+  "languages": ["go", "java", "javascript", "mjs", "python", "typescript"],
+  "bundled_by_lang": {"python": 451, "typescript": 54, "javascript": 2},
+  "repo_root": "/tmp/pviz-repo-abc123",
+  "repo_name": "pviz-repo-abc123"
+}
+```
+
+---
+
+#### nodes (File/module metadata)
+
+Nodes are stored in **schema-encoded format** with abbreviated field names. The `legend` maps abbreviations to full names.
+
+**Common Node Fields (see `legend` for full names):**
+
+| Abbrev | Full Name | Type | Description |
+|--------|-----------|------|-------------|
+| `f` | `file` | string | File path |
+| `id` | `node_id` | string | Unique node identifier |
+| `n` | `name` | string | Module/file name |
+| `lang` | `language` | string | Primary language |
+| `ext` | `file_ext` | string | File extension |
+| `m` | `module_guess` | string | Inferred module path |
+| `pkg` | `package` | string | Package name |
+| `loc` | `loc` | integer | Lines of code |
+| `sloc` | `sloc` | integer | Source lines of code |
+| `ps` | `parse_status` | enum | "ok", "error", "partial" (encoded as 0, 1, 2) |
+| `ic` | `importers_count` | integer | Files that import this |
+| `dc` | `dependencies_count` | integer | Files this imports |
+| `imp` | `imports` | array | List of imported modules |
+| `pex` | `public_exports` | array | Exported symbols |
+| `fn` | `functions` | array | Function names |
+| `fnd` | `functions_detailed` | array | Detailed function metadata |
+| `cl` | `classes` | array | Class names |
+| `cld` | `classes_detailed` | array | Detailed class metadata |
+| `g` | `globals` | array | Global variable names |
+| `gd` | `globals_detailed` | array | Detailed global metadata |
+
+**Example node (decoded):**
+```json
+{
+  "file": "backend/api/auth.py",
+  "node_id": "backend/api/auth.py",
+  "name": "auth",
+  "language": "python",
+  "module_guess": "backend.api.auth",
+  "loc": 245,
+  "sloc": 198,
+  "parse_status": "ok",
+  "importers_count": 12,
+  "dependencies_count": 5,
+  "imports": ["fastapi", "jwt", "passlib"],
+  "functions": ["login", "verify_token", "hash_password"],
+  "functions_detailed": [...]
+}
+```
+
+---
+
+#### functions_detailed[] (Function metadata)
+
+Functions are stored with abbreviated keys to save space.
+
+| Abbrev | Full Name | Type | Description |
+|--------|-----------|------|-------------|
+| `n` | `name` | string | Function name |
+| `ln` | `lineno` | integer | Line number where function starts |
+| `doc` | `docstring` | string | Function docstring (if present) |
+| `rt` | `return_type` | integer | Return type hint (index into `type_strings`) |
+| `p` | `parameters` | array | Function parameters |
+| `a` | `is_async` | 0/1 | Whether function is async (0=false, 1=true) |
+| `g` | `is_generator` | 0/1 | Whether function is generator |
+| `d` | `decorators` | array | Decorator names |
+
+**Example function (decoded):**
+```json
+{
+  "name": "verify_token",
+  "lineno": 45,
+  "docstring": "Verify JWT token and return user ID",
+  "return_type": "Optional[str]",
+  "parameters": [
+    {"name": "token", "type_hint": "str", "kind": "positional_or_keyword"}
+  ],
+  "is_async": false,
+  "is_generator": false
+}
+```
+
+---
+
+#### parameters[] (Function parameters)
+
+| Abbrev | Full Name | Type | Description |
+|--------|-----------|------|-------------|
+| `n` | `name` | string | Parameter name |
+| `t` | `type_hint` | integer | Type hint (index into `type_strings`) |
+| `d` | `default` | string | Default value (if present) |
+| `k` | `kind` | integer | Parameter kind (index into `param_kind` enum) |
+
+**Parameter kinds (enum values):**
+- `0` = `"positional_or_keyword"` (default)
+- `1` = `"positional_only"`
+- `2` = `"keyword_only"`
+- `3` = `"var_positional"` (*args)
+- `4` = `"var_keyword"` (**kwargs)
+
+**Example parameter (decoded):**
+```json
+{
+  "name": "user_id",
+  "type_hint": "str",
+  "default": null,
+  "kind": "positional_or_keyword"
+}
+```
+
+---
+
+#### type_strings[] (Deduplicated type hints)
+
+Array of unique type hints referenced throughout the artifact. Functions and parameters reference types by index.
+
+**Example:**
+```json
+{
+  "type_strings": [
+    "str",
+    "int",
+    "bool",
+    "Optional[str]",
+    "Dict[str, Any]",
+    "List[str]",
+    ...
+  ]
+}
+```
+
+When a function has `"rt": 4`, the return type is `type_strings[4]` = `"Dict[str, Any]"`.
+
+---
+
+#### edges[] (Dependencies)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | File/module being imported |
+| `target` | string | File/module that imports |
+| `kind` | string | Edge type ("import", "call", "inheritance", etc.) |
+| `source_line` | integer | Line number in source file (if available) |
+| `meta` | object | Additional edge metadata |
+
+**Example:**
+```json
+{
+  "source": "backend/api/auth.py",
+  "target": "backend/services/user.py",
+  "kind": "import",
+  "source_line": 5
+}
+```
+
+---
+
+#### summary (High-level metrics)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_files` | integer | Number of source files analyzed |
 | `total_sloc` | integer | Total source lines of code |
+| `total_nodes` | integer | Total nodes in graph |
+| `total_edges` | integer | Total dependency edges |
+| `languages` | object | File counts per language |
+| `top_level_modules` | array | Root-level modules detected |
 
-#### dependencies[]
+**Example:**
+```json
+{
+  "total_files": 511,
+  "total_sloc": 45230,
+  "total_nodes": 511,
+  "total_edges": 767,
+  "languages": {
+    "python": 451,
+    "typescript": 54,
+    "javascript": 2
+  }
+}
+```
+
+---
+
+#### discovery_manifest (Entry points & tests)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `source` | string | Module/file that imports |
-| `target` | string | Module/file being imported |
-| `import_type` | string | "module", "class", "function" |
-| `file_path` | string | Relative path to source file |
-| `line_number` | integer | Line where import occurs |
+| `schema_version` | string | Discovery schema version |
+| `entry_points` | array | Detected entry points (main functions, API servers, CLI tools) |
+| `warnings` | array | Analysis warnings (dynamic imports, missing dependencies) |
+| `src_roots` | array | Detected source root directories |
 
-#### metrics
+**Entry point structure:**
+```json
+{
+  "confidence": 0.95,
+  "evidence": ["has_if_dunder_main", "calls_main()"],
+  "file": "backend/main.py",
+  "id": "backend/main.py:main",
+  "kind": "script_main_guard_call_main",
+  "priority": 9,
+  "source": "python_main_guard",
+  "symbol": "main"
+}
+```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `total_files` | integer | Source files analyzed |
-| `total_sloc` | integer | Source lines of code |
-| `total_dependencies` | integer | Total import relationships |
-| `avg_dependencies_per_file` | float | Mean dependencies per file |
-| `max_dependencies` | integer | Highest dependency count in one file |
-| `modularity_score` | float | 0-1, higher = more modular |
-| `coupling_score` | float | 0-1, lower = less coupled |
+---
 
+### Decoding Compressed Format
+
+To decode the compressed format back to human-readable:
+
+1. **Resolve abbreviated field names** using the `legend`
+2. **Decode enum values** using the `enums` mappings
+3. **Resolve type hint indices** using `type_strings` array
+4. **Reconstruct nested objects** from array format
+
+**Example decoding:**
+```python
+# Compressed
+{"n": "func", "ln": 42, "rt": 5, "a": 1}
+
+# Decoded (using legend and type_strings)
+{
+  "name": "func",
+  "lineno": 42,
+  "return_type": "Dict[str, Any]",  # type_strings[5]
+  "is_async": true  # 1 = true
+}
+```
+
+---
+
+### Format Comparison
+
+| Feature | Standard Format | Compressed Format |
+|---------|----------------|-------------------|
+| **Size** | ~3.5 MB | ~1.5 MB (58% smaller) |
+| **Readability** | High (full field names) | Medium (requires legend) |
+| **Token efficiency** | Lower | Higher (optimized for LLMs) |
+| **Lossless** | Yes | Yes (perfect round-trip) |
+| **Fields** | Full names | Abbreviated |
+| **Type hints** | Repeated strings | Deduplicated array |
+| **Enums** | String values | Integer indices |
+
+Both formats contain identical information. Use **standard** for debugging, **compressed** for LLM consumption.
 #### circular_dependencies[]
 
 | Field | Type | Description |
