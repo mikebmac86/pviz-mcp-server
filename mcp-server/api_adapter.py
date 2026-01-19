@@ -175,7 +175,7 @@ class PvizAPIAdapter:
         Endpoint: POST /jobs/github
 
         NOTE:
-          - languages is currently NOT USED if your backend doesn't filter by language yet.
+          - languages is currently NOT USED if your backend doesn’t filter by language yet.
           - expected_tokens: if None, we estimate first (authoritative on backend anyway, but helps UX).
         """
         endpoint = f"{self.base_url}/jobs/github"
@@ -218,7 +218,7 @@ class PvizAPIAdapter:
         return response.json()
 
     # ========================================================================
-    # JOB HISTORY & MANAGEMENT (NEW)
+    # JOB HISTORY
     # ========================================================================
 
     async def get_job_history(self, client: httpx.AsyncClient, limit: int = 10, skip: int = 0) -> Dict[str, Any]:
@@ -263,172 +263,15 @@ class PvizAPIAdapter:
 
         return {"total": total, "jobs": jobs}
 
-    async def list_jobs(
-        self,
-        client: httpx.AsyncClient,
-        status: Optional[str] = None,
-        limit: int = 10,
-        skip: int = 0,
-        include_failed: bool = True,
-        include_canceled: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        List jobs with filtering options.
-
-        Endpoint: GET /jobs (with query params)
-
-        Query params:
-        - status: Filter by job status
-        - limit: Max results
-        - skip: Pagination offset
-        - include_failed: Whether to include failed jobs
-        - include_canceled: Whether to include canceled jobs
-        """
-        endpoint = f"{self.base_url}/jobs"
-
-        params: Dict[str, Any] = {
-            "limit": max(1, min(int(limit), 50)),
-            "skip": max(0, int(skip)),
-        }
-
-        if status:
-            params["status"] = status
-        if not include_failed:
-            params["exclude_failed"] = "true"
-        if include_canceled:
-            params["include_canceled"] = "true"
-
-        response = await client.get(endpoint, headers=self.get_headers(), params=params, timeout=30.0)
-        response.raise_for_status()
-        data = response.json()
-
-        # Normalize response
-        if isinstance(data, list):
-            jobs = data
-            total = len(data)
-        elif isinstance(data, dict):
-            jobs = data.get("items") or data.get("jobs") or []
-            total = int(data.get("total") or len(jobs))
-        else:
-            jobs = []
-            total = 0
-
-        return {
-            "total": total,
-            "jobs": jobs,
-            "filters_applied": {
-                "status": status,
-                "include_failed": include_failed,
-                "include_canceled": include_canceled,
-            },
-        }
-
-    async def get_job_details(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
-        """
-        Get comprehensive job details.
-
-        Endpoint: GET /jobs/{job_id}/details
-        
-        Returns detailed job information including:
-        - Basic info (id, status, repo_url, branch)
-        - Timestamps (created_at, completed_at)
-        - Token info (estimated, charged)
-        - Metrics (file_count, sloc)
-        - Artifacts (paths, sizes, compression ratio)
-        - Pricing (choice, trial info)
-        - LLM report status
-        - Errors (if failed)
-        - Cancellation info
-        """
-        endpoint = f"{self.base_url}/jobs/{job_id}/details"
-        response = await client.get(endpoint, headers=self.get_headers(), timeout=30.0)
-        response.raise_for_status()
-        return response.json()
-
-    async def get_repo_summary(self, client: httpx.AsyncClient, repo_url: str) -> Dict[str, Any]:
-        """
-        Get all past analyses for a specific repository.
-
-        Endpoint: GET /jobs/repo-summary
-
-        Query params:
-        - repo_url: Repository URL (will be normalized)
-        """
-        endpoint = f"{self.base_url}/jobs/repo-summary"
-        params = {"repo_url": repo_url}
-
-        response = await client.get(endpoint, headers=self.get_headers(), params=params, timeout=30.0)
-        response.raise_for_status()
-        return response.json()
-
-    async def cancel_job(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
-        """
-        Request cancellation of a running job.
-
-        Endpoint: POST /jobs/{job_id}/cancel
-
-        Note: Cancellation is asynchronous. Job may take moments to fully stop.
-        """
-        endpoint = f"{self.base_url}/jobs/{job_id}/cancel"
-        response = await client.post(endpoint, headers=self.get_headers(), timeout=30.0)
-        response.raise_for_status()
-        return response.json()
-
-    # ========================================================================
-    # ARTIFACT MANAGEMENT (NEW)
-    # ========================================================================
-
-    async def get_artifact_formats(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
-        """
-        Get available artifact formats and download links.
-
-        Endpoint: GET /jobs/{job_id}/artifact-formats
-
-        Returns both standard and compressed format info including:
-        - Pre-signed S3 URLs
-        - File sizes
-        - Compression ratios
-        - Format descriptions
-        """
-        endpoint = f"{self.base_url}/jobs/{job_id}/artifact-formats"
-        response = await client.get(
-            endpoint,
-            headers=self.get_headers(),
-            params={"ts": int(time.time())},  # Force fresh presigned URLs
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def get_llm_report(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
-        """
-        Get LLM-generated analysis report.
-
-        Endpoint: GET /jobs/{job_id}/llm-report
-
-        Returns:
-        - markdown: Report in markdown format
-        - json_result: Structured analysis result
-        - download_urls: S3 links if report is stored
-        - status: Report generation status
-        """
-        endpoint = f"{self.base_url}/jobs/{job_id}/llm-report"
-        response = await client.get(endpoint, headers=self.get_headers(), timeout=30.0)
-        response.raise_for_status()
-        return response.json()
-
     # ========================================================================
     # DOWNLOAD RESULTS
     # ========================================================================
 
     async def get_download_link(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
         """
-        Get presigned download link for completed job (standard format).
+        Get presigned download link for completed job.
 
         Endpoint: GET /jobs/{job_id}/download-link
-        
-        Note: This returns the standard format by default.
-        Use get_artifact_formats() to get both standard and compressed formats.
         """
         endpoint = f"{self.base_url}/jobs/{job_id}/download-link"
 
@@ -493,7 +336,7 @@ class PvizAPIAdapter:
         Return the backend's real status value as-is (normalized to lowercase).
 
         IMPORTANT:
-          Do NOT map to "processing/pending" here — the MCP server's polling logic
+          Do NOT map to "processing/pending" here — the MCP server’s polling logic
           needs the original statuses to determine terminal states reliably.
         """
         v = status_response.get("status", "unknown")
@@ -614,36 +457,8 @@ async def test_adapter():
             print(f"❌ Failed: {e}")
             return
 
-        # Test 5: List jobs with filters (NEW)
-        print("\n5️⃣  Testing list_jobs with filters...")
-        try:
-            filtered = await adapter.list_jobs(
-                client, 
-                status="completed",
-                limit=3,
-                include_failed=False
-            )
-            print(f"✅ Completed jobs: {len(filtered['jobs'])}")
-            print(f"   Filters: {filtered['filters_applied']}")
-        except Exception as e:
-            print(f"⚠️  Not implemented yet (expected): {e}")
-
-        # Test 6: Get job details (NEW)
-        if history["jobs"]:
-            print("\n6️⃣  Testing get_job_details...")
-            job_id = history["jobs"][0].get("id")
-            try:
-                details = await adapter.get_job_details(client, job_id)
-                print(f"✅ Job details for {job_id}:")
-                print(f"   Status: {details.get('status')}")
-                print(f"   Tokens: {details.get('tokens_charged')}")
-                if details.get('artifacts'):
-                    print(f"   Artifacts: {list(details['artifacts'].keys())}")
-            except Exception as e:
-                print(f"⚠️  Not implemented yet (expected): {e}")
-
-        # Test 7: Repo URL parsing
-        print("\n7️⃣  Testing repo URL parsing...")
+        # Test 5: Repo URL parsing
+        print("\n5️⃣  Testing repo URL parsing...")
         test_urls = [
             "django/django",
             "https://github.com/facebook/react",
@@ -655,10 +470,9 @@ async def test_adapter():
             print(f"   → {spec}")
 
         print("\n" + "=" * 60)
-        print("✅ Core tests passed!")
+        print("✅ All tests passed!")
         print("=" * 60)
-        print("\n⚠️  New endpoints (list_jobs, get_job_details, etc.)")
-        print("    will need to be implemented in your backend.")
+        print("\nAdapter is configured correctly and ready to use.")
 
 
 if __name__ == "__main__":
