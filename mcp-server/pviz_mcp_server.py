@@ -631,7 +631,7 @@ async def retrieve_past_result(
     if raw_status != "completed":
         return {"success": False, "status": raw_status or "unknown", "details": status}
 
-    artifacts = await api.get_job_artifacts(client, job_id, prefer="both", force_fresh=True)
+    artifacts = await api.get_job_artifacts(client, job_id, prefer=prefer_artifact, force_fresh=True)
     artifact_formats = artifacts.get("artifact_formats") if isinstance(artifacts, dict) else None
 
     preferred_url = _pick_artifact_url(artifact_formats or {}, prefer=prefer_artifact)
