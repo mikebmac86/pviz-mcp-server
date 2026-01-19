@@ -12,7 +12,8 @@ import asyncio
 import httpx
 import random
 import logging
-from typing import Any, Dict, Optional, List
+import hashlib
+from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -47,6 +48,21 @@ DOWNLOAD_TIMEOUT_S = float(os.getenv("PVIZ_DOWNLOAD_TIMEOUT_S", "120"))
 HTTP_TIMEOUT_S = float(os.getenv("PVIZ_HTTP_TIMEOUT_S", "30"))
 HTTP_CONNECT_TIMEOUT_S = float(os.getenv("PVIZ_HTTP_CONNECT_TIMEOUT_S", "10"))
 
+# Cache hardening toggles
+# - PVIZ_NO_CACHE=1 adds no-cache headers on the shared client
+# - PVIZ_FORCE_FRESH_IDENTITY=1 forces a brand new client (no pooled connections)
+#   for identity-sensitive endpoints like account/balance/history
+NO_CACHE_DEFAULT = os.getenv("PVIZ_NO_CACHE", "1").strip().lower() not in ("0", "false", "no")
+FORCE_FRESH_IDENTITY = os.getenv("PVIZ_FORCE_FRESH_IDENTITY", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+# Note: Adapter already supports cache busting via force_fresh. We keep this
+# only for any direct HTTP calls in the future.
+CACHE_BUSTER_DEFAULT = os.getenv("PVIZ_CACHE_BUSTER", "1").strip().lower() not in ("0", "false", "no")
+
 TERMINAL_SUCCESS = {"completed"}
 TERMINAL_FAILURE = {
     "failed",
@@ -70,10 +86,9 @@ class PvizAPIError(Exception):
 async def _handle_private_repo_error(error_detail: str, status_code: int) -> Optional[Dict[str, Any]]:
     """
     Detect if error indicates private repo and return helpful response.
-    
+
     Returns None if not a private repo error, otherwise returns error dict.
     """
-    # Common patterns in API errors for private repos
     private_indicators = [
         "not found",
         "repository not found",
@@ -84,10 +99,10 @@ async def _handle_private_repo_error(error_detail: str, status_code: int) -> Opt
         "access denied",
         "permission denied",
     ]
-    
+
     detail_lower = (error_detail or "").lower()
     is_private = (status_code in (400, 404)) and any(indicator in detail_lower for indicator in private_indicators)
-    
+
     if is_private:
         return {
             "success": False,
@@ -107,27 +122,41 @@ async def _handle_private_repo_error(error_detail: str, status_code: int) -> Opt
             "requires_github_token": True,
             "help_url": "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token",
         }
-    
+
     return None
 
 
 # -----------------------------------------------------------------------------
-# JWT loading (ENV or FILE)
+# JWT loading (ENV or FILE) + non-sensitive debug fingerprint
 # -----------------------------------------------------------------------------
 def _read_text_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-def load_jwt_token() -> str:
+def _token_fingerprint(tok: str) -> str:
+    """
+    Non-sensitive token fingerprint for debugging.
+    DOES NOT log the full token.
+    """
+    t = (tok or "").strip()
+    if not t:
+        return "empty"
+    h = hashlib.sha256(t.encode("utf-8")).hexdigest()[:12]
+    return f"sha256[:12]={h} len={len(t)} head={t[:6]!r} tail={t[-6:]!r}"
+
+
+def load_jwt_token_with_source() -> Tuple[str, str]:
     """
     Load JWT token from:
       1) PVIZ_JWT_TOKEN (direct env)
       2) PVIZ_JWT_TOKEN_FILE (docker secret file path)
+
+    Returns: (token, source) where source is 'env' or 'file'
     """
     tok = os.getenv("PVIZ_JWT_TOKEN")
     if tok and tok.strip():
-        return tok.strip()
+        return tok.strip(), "env"
 
     tok_file = os.getenv("PVIZ_JWT_TOKEN_FILE")
     if tok_file and tok_file.strip():
@@ -135,33 +164,62 @@ def load_jwt_token() -> str:
             raw = _read_text_file(tok_file.strip())
             tok2 = (raw or "").strip()
             if tok2:
-                return tok2
+                return tok2, "file"
         except FileNotFoundError as e:
-            raise PvizAPIError(
-                f"PVIZ_JWT_TOKEN_FILE points to missing file: {tok_file!r}"
-            ) from e
+            raise PvizAPIError(f"PVIZ_JWT_TOKEN_FILE points to missing file: {tok_file!r}") from e
         except Exception as e:
-            raise PvizAPIError(
-                f"Failed to read PVIZ_JWT_TOKEN_FILE={tok_file!r}: {e}"
-            ) from e
+            raise PvizAPIError(f"Failed to read PVIZ_JWT_TOKEN_FILE={tok_file!r}: {e}") from e
 
     raise PvizAPIError("JWT not configured: set PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE")
 
 
+def load_jwt_token() -> str:
+    tok, _src = load_jwt_token_with_source()
+    return tok
+
+
 def _adapter() -> PvizAPIAdapter:
+    # Create adapter per call so it always pulls the latest token from env/file.
+    # Adapter itself will do no-cache + cb cache busting on identity endpoints.
     return PvizAPIAdapter(API_BASE_URL, load_jwt_token())
 
 
+# -----------------------------------------------------------------------------
+# HTTP client (shared) + cache control + explicit clearing
+# -----------------------------------------------------------------------------
 _client: Optional[httpx.AsyncClient] = None
 
 
+def _default_headers() -> Dict[str, str]:
+    """
+    Headers to strongly discourage caching by proxies/CDNs.
+    httpx itself does not cache, but intermediate layers might.
+    """
+    if not NO_CACHE_DEFAULT:
+        return {}
+
+    return {
+        "Cache-Control": "no-store, no-cache, max-age=0, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+
+def _make_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout=HTTP_TIMEOUT_S, connect=HTTP_CONNECT_TIMEOUT_S),
+        follow_redirects=True,
+        headers=_default_headers(),
+    )
+
+
 def _get_client() -> httpx.AsyncClient:
+    """
+    Shared client for general use.
+    """
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout=HTTP_TIMEOUT_S, connect=HTTP_CONNECT_TIMEOUT_S),
-            follow_redirects=True,
-        )
+        _client = _make_client()
     return _client
 
 
@@ -172,6 +230,26 @@ async def _close_client() -> None:
     _client = None
 
 
+async def _get_identity_client() -> httpx.AsyncClient:
+    """
+    Identity endpoints (account/balance/history) are the ones most likely to
+    appear "wrong" if there is any caching or token drift.
+
+    If FORCE_FRESH_IDENTITY is enabled:
+      - close the shared client (clears pooled connections)
+      - create a brand new client for this call
+      - close it after use (via try/finally at callsite)
+    """
+    if not FORCE_FRESH_IDENTITY:
+        return _get_client()
+
+    await _close_client()
+    return _make_client()
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def _normalize_repo_url(repo_url: str) -> str:
     repo_url = (repo_url or "").strip()
     if not repo_url:
@@ -218,9 +296,7 @@ async def _download_json_streaming(url: str) -> Dict[str, Any]:
                 continue
             total += len(chunk)
             if total > MAX_ARTIFACT_BYTES:
-                raise PvizAPIError(
-                    f"Artifact exceeds size limit: {total} > {MAX_ARTIFACT_BYTES}"
-                )
+                raise PvizAPIError(f"Artifact exceeds size limit: {total} > {MAX_ARTIFACT_BYTES}")
             chunks.append(chunk)
 
     try:
@@ -237,13 +313,9 @@ async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
     for _ in range(MAX_POLL_ATTEMPTS):
         status = await api.get_job_status(client, job_id)
 
-        # IMPORTANT: api_adapter.get_job_status_value() currently returns
-        # "completed" | "failed" | "processing" | "pending" | <raw>.
-        # So we handle both normalized and raw.
         state = (api.get_job_status_value(status) or "").lower().strip()
         raw_state = (status.get("status") or "").lower().strip() if isinstance(status, dict) else ""
 
-        # Treat terminal if either normalized says completed/failed OR raw is terminal-like.
         if state in ("completed", "failed"):
             return status
         if raw_state in TERMINAL_STATES:
@@ -257,64 +329,181 @@ async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# MCP TOOLS - ACCOUNT & BALANCE
+# MCP TOOLS - CACHE / DEBUG
 # =============================================================================
+@mcp.tool()
+async def clear_http_cache() -> Dict[str, Any]:
+    """
+    Clear in-process HTTP client state (connection pools, keep-alives).
+    Useful after credential changes or to rule out stale pooled connections.
+    """
+    await _close_client()
+    return {
+        "success": True,
+        "message": "HTTP client closed. A new client will be created on the next request.",
+        "api_base_url": API_BASE_URL,
+    }
 
+
+@mcp.tool()
+async def debug_auth_fingerprint() -> Dict[str, Any]:
+    """
+    Non-sensitive debug info to confirm which JWT and API base URL the MCP server is using.
+    Helps catch env-vs-file token drift and wrong environment issues.
+    """
+    tok, src = load_jwt_token_with_source()
+    return {
+        "success": True,
+        "api_base_url": API_BASE_URL,
+        "token_source": src,
+        "token_fingerprint": _token_fingerprint(tok),
+        "no_cache_headers_enabled": NO_CACHE_DEFAULT,
+        "force_fresh_identity_enabled": FORCE_FRESH_IDENTITY,
+        "cache_buster_enabled": CACHE_BUSTER_DEFAULT,
+    }
+
+
+@mcp.tool()
+async def billing_diagnostics(limit_transactions: int = 20) -> Dict[str, Any]:
+    """
+    One-shot identity + billing diagnostics.
+
+    Returns:
+      - /auth/me
+      - /tokens/balance
+      - /tokens/overview (optional lightweight compare)
+      - /tokens/transactions (recent)
+
+    This is the best tool to run when balance looks "wrong".
+    """
+    api = _adapter()
+    client = await _get_identity_client()
+    try:
+        me = await api.get_account_info(client, force_fresh=True)
+        bal = await api.get_token_balance(client, force_fresh=True)
+        ov = await api.get_token_overview(client, force_fresh=True)
+        tx = await api.get_token_transactions(
+            client,
+            skip=0,
+            limit=max(1, min(int(limit_transactions or 20), 200)),
+            force_fresh=True,
+        )
+
+        # Basic consistency check (doesn't assert correctness, just flags mismatch)
+        bal_current = bal.get("current_balance") if isinstance(bal, dict) else None
+        ov_current = ov.get("balance") if isinstance(ov, dict) else None
+
+        return {
+            "success": True,
+            "account": me,
+            "token_balance": bal,
+            "token_overview": ov,
+            "token_transactions": tx,
+            "consistency": {
+                "balance_endpoint": bal_current,
+                "overview_endpoint": ov_current,
+                "matches": (bal_current == ov_current) if (bal_current is not None and ov_current is not None) else None,
+            },
+        }
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
+# =============================================================================
+# MCP TOOLS - ACCOUNT & TOKENS
+# =============================================================================
 @mcp.tool()
 async def get_account_info() -> Dict[str, Any]:
     """
     Get account information including email, plan, and verification status.
-    
-    Returns:
-        Account details from the API
     """
     api = _adapter()
-    client = _get_client()
-    return await api.get_account_info(client)
+    client = await _get_identity_client()
+    try:
+        return await api.get_account_info(client, force_fresh=True)
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 @mcp.tool()
 async def get_token_balance() -> Dict[str, Any]:
     """
-    Get current token balance and account overview.
-    
-    Returns:
-        Dict containing:
-        - balance: Current token balance
-        - plan: Account plan (free, pro, etc.)
-        - trial: Trial information if applicable
-        - products: Available products
-        - full_overview: Complete overview data
+    Get token balance (lightweight).
     """
     api = _adapter()
-    client = _get_client()
-    return await api.get_token_balance(client)
+    client = await _get_identity_client()
+    try:
+        return await api.get_token_balance(client, force_fresh=True)
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
+@mcp.tool()
+async def get_token_overview() -> Dict[str, Any]:
+    """
+    Get token overview (balance + products + trial summary).
+    """
+    api = _adapter()
+    client = await _get_identity_client()
+    try:
+        return await api.get_token_overview(client, force_fresh=True)
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
+@mcp.tool()
+async def get_token_transactions(skip: int = 0, limit: int = 50) -> Dict[str, Any]:
+    """
+    Get token transaction history (ledger).
+    """
+    api = _adapter()
+    client = await _get_identity_client()
+    try:
+        return await api.get_token_transactions(client, skip=skip, limit=limit, force_fresh=True)
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 @mcp.tool()
 async def check_sufficient_balance(required_tokens: int) -> Dict[str, Any]:
     """
     Check if user has sufficient token balance for an operation.
-    
-    Args:
-        required_tokens: Number of tokens required
-        
-    Returns:
-        Dict containing:
-        - can_afford: Boolean indicating if balance is sufficient
-        - current_balance: Current token balance
-        - required: Required tokens
-        - shortfall: Token shortfall if insufficient (only if can_afford is False)
     """
     api = _adapter()
-    client = _get_client()
-    return await api.check_sufficient_balance(client, required_tokens)
+    client = await _get_identity_client()
+    try:
+        return await api.check_sufficient_balance(client, required_tokens, force_fresh=True)
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 # =============================================================================
 # MCP TOOLS - COST ESTIMATION
 # =============================================================================
-
 @mcp.tool()
 async def estimate_cost(
     repo_url: str,
@@ -322,51 +511,31 @@ async def estimate_cost(
 ) -> Dict[str, Any]:
     """
     Estimate the cost (in tokens) for analyzing a repository before submitting.
-    
-    Args:
-        repo_url: GitHub repository URL or "owner/repo" format
-        github_token: Optional GitHub token for private repos (required for private repositories)
-        
-    Returns:
-        Dict containing:
-        - tokens_needed: Estimated tokens required
-        - sloc: Source lines of code
-        - file_count: Number of files
-        - can_afford: Whether user has sufficient balance
-        
-        OR if repository is private and no token provided:
-        - success: False
-        - error: "private_repository"
-        - message: Instructions for creating GitHub PAT
-        - requires_github_token: True
     """
     repo_url = _normalize_repo_url(repo_url)
     api = _adapter()
     client = _get_client()
-    
+
     try:
         return await api.estimate_cost(client, repo_url, github_token)
     except httpx.HTTPStatusError as e:
-        # Check if this is a private repo error
         detail = str(e)
         try:
             error_body = e.response.json()
             detail = error_body.get("detail", detail)
         except Exception:
             pass
-        
+
         private_error = await _handle_private_repo_error(detail, e.response.status_code)
         if private_error:
             return private_error
-        
-        # Re-raise if not a private repo error
+
         raise
 
 
 # =============================================================================
 # MCP TOOLS - JOB HISTORY
 # =============================================================================
-
 @mcp.tool()
 async def get_job_history(
     limit: int = 10,
@@ -374,25 +543,22 @@ async def get_job_history(
 ) -> Dict[str, Any]:
     """
     Get recent job history with pagination.
-    
-    Args:
-        limit: Maximum number of jobs to return (1-50, default 10)
-        skip: Number of jobs to skip for pagination (default 0)
-        
-    Returns:
-        Dict containing:
-        - total: Total number of jobs
-        - jobs: List of job objects
     """
     api = _adapter()
-    client = _get_client()
-    return await api.get_job_history(client, limit, skip)
+    client = await _get_identity_client()
+    try:
+        return await api.get_job_history(client, limit=limit, skip=skip, force_fresh=True)
+    finally:
+        if FORCE_FRESH_IDENTITY:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 # =============================================================================
 # MCP TOOLS - REPOSITORY ANALYSIS
 # =============================================================================
-
 @mcp.tool()
 async def analyze_repository(
     repo_url: str,
@@ -404,23 +570,6 @@ async def analyze_repository(
 ) -> Dict[str, Any]:
     """
     Submit a repository for dependency analysis.
-    
-    Args:
-        repo_url: GitHub repository URL or "owner/repo" format
-        wait_for_completion: If True, wait for analysis to complete
-        include_full_graph: If True, include full dependency graph in response
-        pricing_choice: Payment method ("tokens" or "trial_credit")
-        questions: Optional list of analysis questions
-        github_token: Optional GitHub token for private repos (required for private repositories)
-        
-    Returns:
-        Dict containing analysis results or job status
-        
-        OR if repository is private and no token provided:
-        - success: False
-        - error: "private_repository"
-        - message: Instructions for creating GitHub PAT
-        - requires_github_token: True
     """
     repo_url = _normalize_repo_url(repo_url)
     api = _adapter()
@@ -435,19 +584,17 @@ async def analyze_repository(
             github_token=github_token,
         )
     except httpx.HTTPStatusError as e:
-        # Check if this is a private repo error
         detail = str(e)
         try:
             error_body = e.response.json()
             detail = error_body.get("detail", detail)
         except Exception:
             pass
-        
+
         private_error = await _handle_private_repo_error(detail, e.response.status_code)
         if private_error:
             return private_error
-        
-        # Re-raise if not a private repo error
+
         raise
 
     job_id = api.extract_job_id(submit)
@@ -460,12 +607,10 @@ async def analyze_repository(
     raw_status = (status.get("status") or "").lower().strip()
     normalized = (api.get_job_status_value(status) or "").lower().strip()
 
-    # Decide success/failure using raw + normalized
     is_completed = (raw_status == "completed") or (normalized == "completed")
     if not is_completed:
         return {"success": False, "status": raw_status or normalized or "unknown", "details": status}
 
-    # Your adapter correctly notes: status does NOT include a usable S3 url; fetch download link
     download = await api.get_download_link(client, job_id)
     s3_url = download.get("url") or download.get("s3_url")
 
@@ -489,39 +634,26 @@ async def analyze_repository(
 async def get_analysis_status(job_id: str) -> Dict[str, Any]:
     """
     Get the current status of an analysis job.
-    
-    Args:
-        job_id: Job ID to check
-        
-    Returns:
-        Job status information
     """
     api = _adapter()
-    return await api.get_job_status(_get_client(), job_id)
+    return await api.get_job_status(_get_client(), job_id, force_fresh=True)
 
 
 @mcp.tool()
 async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> Dict[str, Any]:
     """
     Retrieve results from a completed analysis job.
-    
-    Args:
-        job_id: Job ID to retrieve
-        include_full_graph: If True, include full dependency graph
-        
-    Returns:
-        Analysis results if job is completed
     """
     api = _adapter()
     client = _get_client()
 
-    status = await api.get_job_status(client, job_id)
+    status = await api.get_job_status(client, job_id, force_fresh=True)
     raw_status = (status.get("status") or "").lower().strip()
 
     if raw_status != "completed":
         return {"success": False, "status": raw_status or "unknown", "details": status}
 
-    download = await api.get_download_link(client, job_id)
+    download = await api.get_download_link(client, job_id, force_fresh=True)
     s3_url = download.get("url") or download.get("s3_url")
 
     result: Dict[str, Any] = {
@@ -546,6 +678,21 @@ async def retrieve_past_result(job_id: str, include_full_graph: bool = True) -> 
 if __name__ == "__main__":
     logger.info("Starting pviz MCP server (stdio)")
     try:
+        # Helpful one-time startup log (non-sensitive)
+        try:
+            tok, src = load_jwt_token_with_source()
+            logger.info(
+                "MCP config: api_base=%s token_source=%s token_fp=%s no_cache=%s force_fresh_identity=%s cache_buster=%s",
+                API_BASE_URL,
+                src,
+                _token_fingerprint(tok),
+                NO_CACHE_DEFAULT,
+                FORCE_FRESH_IDENTITY,
+                CACHE_BUSTER_DEFAULT,
+            )
+        except Exception as e:
+            logger.warning("MCP config debug unavailable: %s", e)
+
         mcp.run()
     finally:
         try:

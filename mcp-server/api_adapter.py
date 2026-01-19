@@ -1,136 +1,469 @@
+# mcp-server/api_adapter.py
+from __future__ import annotations
+
 import os
-from typing import Dict, Any, Optional, List
-import httpx
-from urllib.parse import urlparse
 import time
+import hashlib
+from typing import Dict, Any, Optional, List, Tuple
+from urllib.parse import urlparse
+
+import httpx
+
+
+# ==============================================================================
+# Token loading (single source of truth) + non-sensitive fingerprinting
+# ==============================================================================
 
 def _read_text_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-def _load_jwt_from_env() -> Optional[str]:
+def load_jwt_token_with_source() -> Tuple[str, str]:
+    """
+    Load JWT token from:
+      1) PVIZ_JWT_TOKEN (direct env)
+      2) PVIZ_JWT_TOKEN_FILE (docker secret file path)
+
+    Returns: (token, source) where source is 'env' or 'file'
+    Raises: ValueError if not configured.
+    """
     tok = os.getenv("PVIZ_JWT_TOKEN")
     if tok and tok.strip():
-        return tok.strip()
+        return tok.strip(), "env"
 
     tok_file = os.getenv("PVIZ_JWT_TOKEN_FILE")
     if tok_file and tok_file.strip():
-        try:
-            raw = _read_text_file(tok_file.strip())
-            tok2 = (raw or "").strip()
-            if tok2:
-                return tok2
-        except Exception:
-            return None
-    return None
+        raw = _read_text_file(tok_file.strip())
+        tok2 = (raw or "").strip()
+        if tok2:
+            return tok2, "file"
+
+    raise ValueError("JWT not configured: set PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE")
+
+
+def token_fingerprint(tok: str) -> str:
+    """
+    Non-sensitive fingerprint for debugging that does not leak the full token.
+    """
+    t = (tok or "").strip().encode("utf-8")
+    if not t:
+        return "none"
+    return hashlib.sha256(t).hexdigest()[:12]
+
+
+def _default_no_cache_headers() -> Dict[str, str]:
+    # Useful for identity/billing endpoints where stale intermediaries are possible.
+    return {
+        "Cache-Control": "no-store, no-cache, max-age=0, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
 
 
 class PvizAPIAdapter:
     """
     Adapter for pviz FastAPI backend.
-    Matches the actual production API structure.
+
+    Additive upgrade:
+      - Single source of truth for JWT sourcing (env or file)
+      - Optional no-cache headers & cache buster support for identity-sensitive GETs
+      - Adds user-relevant API calls aligned to models: tokens ledger, trial, products, orders, jobs detail.
     """
 
-    def __init__(self, base_url: str, jwt_token: str):
-        self.base_url = base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str,
+        jwt_token: Optional[str] = None,
+        *,
+        allow_env_fallback: bool = True,
+        enable_no_cache_headers: bool = True,
+    ):
+        self.base_url = (base_url or "").rstrip("/")
+
         tok = (jwt_token or "").strip()
+        src = "explicit"
         if not tok:
-            env_tok = _load_jwt_from_env()
-            if env_tok:
-                tok = env_tok
+            if not allow_env_fallback:
+                raise ValueError("jwt_token was not provided and allow_env_fallback=False")
+            tok, src = load_jwt_token_with_source()
+
         self.jwt_token = tok
+        self.jwt_source = src  # 'explicit' | 'env' | 'file'
+        self.enable_no_cache_headers = bool(enable_no_cache_headers)
 
     # ------------------------------------------------------------------
-    # Auth / headers
+    # Headers / params helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def load_jwt_token_from_env() -> Optional[str]:
-        """
-        Supports both:
-          - PVIZ_JWT_TOKEN (direct)
-          - PVIZ_JWT_TOKEN_FILE (Docker secret style)
-        """
-        tok = os.getenv("PVIZ_JWT_TOKEN")
-        if tok and tok.strip():
-            return tok.strip()
-
-        path = os.getenv("PVIZ_JWT_TOKEN_FILE")
-        if path and path.strip():
-            try:
-                with open(path.strip(), "r", encoding="utf-8") as f:
-                    v = f.read().strip()
-                    return v if v else None
-            except Exception:
-                return None
-
-        return None
-
-    def get_headers(self) -> Dict[str, str]:
-        """Return auth headers for API requests."""
-        return {
+    def _headers(self, *, force_no_cache: bool = False) -> Dict[str, str]:
+        headers: Dict[str, str] = {
             "Authorization": f"Bearer {self.jwt_token}",
+            "Accept": "application/json",
             "Content-Type": "application/json",
         }
 
-    # ========================================================================
-    # ACCOUNT & BALANCE METHODS
-    # ========================================================================
+        # IMPORTANT:
+        # - You often pass force_no_cache=True on identity/billing endpoints.
+        # - That intent should override enable_no_cache_headers.
+        # - enable_no_cache_headers remains a "default on for identity endpoints" knob,
+        #   but callers can still set force_no_cache=True to guarantee behavior.
+        if force_no_cache or self.enable_no_cache_headers:
+            # NOTE: still safe on most endpoints; but if you want to only apply
+            # when force_no_cache is True, set enable_no_cache_headers=False.
+            headers.update(_default_no_cache_headers())
 
-    async def get_account_info(self, client: httpx.AsyncClient) -> Dict[str, Any]:
+        return headers
+
+    def _maybe_bust_cache(self, params: Optional[Dict[str, Any]], *, force_fresh: bool) -> Dict[str, Any]:
+        out = dict(params or {})
+        if force_fresh:
+            out["cb"] = int(time.time() * 1000)
+        return out
+
+    def debug_token_info(self) -> Dict[str, Any]:
         """
-        Get account information.
+        Non-sensitive debug info to confirm which JWT and API base URL the MCP server is using.
+        """
+        return {
+            "base_url": self.base_url,
+            "token_source": self.jwt_source,
+            "token_fingerprint": token_fingerprint(self.jwt_token),
+            "no_cache_headers_enabled": self.enable_no_cache_headers,
+        }
 
-        Endpoint: GET /auth/me
+    # ========================================================================
+    # ACCOUNT
+    # ========================================================================
+
+    async def get_account_info(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /auth/me
         """
         endpoint = f"{self.base_url}/auth/me"
-        response = await client.get(endpoint, headers=self.get_headers(), timeout=30.0)
-        response.raise_for_status()
-        return response.json()
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
-    async def get_token_balance(self, client: httpx.AsyncClient) -> Dict[str, Any]:
+    # ========================================================================
+    # TOKENS (balance + overview + ledger)
+    # ========================================================================
+
+    async def get_token_balance(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Get token balance and overview.
+        GET /tokens/balance
 
-        Endpoint: GET /tokens/overview
+        Returns lightweight:
+          - current_balance
+          - plan
+          - trial (optional)
+        """
+        endpoint = f"{self.base_url}/tokens/balance"
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        if not isinstance(data, dict):
+            return {"value": data}
+        return data
+
+    async def get_token_overview(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /tokens/overview
+
+        Normalizes:
+          - balance -> current_balance
         """
         endpoint = f"{self.base_url}/tokens/overview"
-        response = await client.get(endpoint, headers=self.get_headers(), timeout=30.0)
-        response.raise_for_status()
-        data = response.json()
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        if not isinstance(data, dict):
+            data = {"value": data}
 
-        # Normalize for easy access
         return {
-            # Your backend uses current_balance (per your earlier frontend typings)
-            "balance": data.get("current_balance", 0),
+            "balance": data.get("current_balance", data.get("balance", 0)),
             "plan": data.get("plan", "free"),
             "trial": data.get("trial"),
             "products": data.get("products", []),
             "full_overview": data,
         }
 
-    async def check_sufficient_balance(self, client: httpx.AsyncClient, required_tokens: int) -> Dict[str, Any]:
+    async def get_token_transactions(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        skip: int = 0,
+        limit: int = 50,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Check if user has sufficient token balance.
+        GET /tokens/transactions?skip=&limit=
+
+        Matches your backend `api/tokens.py` signature.
+
+        Returns normalized:
+          - total
+          - transactions (list)
         """
-        balance_data = await self.get_token_balance(client)
-        current_balance = int(balance_data.get("balance") or 0)
+        endpoint = f"{self.base_url}/tokens/transactions"
+        skip_i = max(0, int(skip or 0))
+        limit_i = max(1, min(int(limit or 50), 200))
 
-        can_afford = current_balance >= int(required_tokens)
+        params: Dict[str, Any] = {"skip": skip_i, "limit": limit_i}
 
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Normalize typical patterns
+        if isinstance(data, list):
+            return {"total": len(data), "transactions": data}
+
+        if isinstance(data, dict):
+            if "items" in data:
+                items = data.get("items") or []
+                return {"total": int(data.get("total") or len(items)), "transactions": items}
+            if "transactions" in data:
+                tx = data.get("transactions") or []
+                return {"total": int(data.get("total") or len(tx)), "transactions": tx}
+
+        return {"total": 0, "transactions": []}
+
+    async def check_sufficient_balance(
+        self,
+        client: httpx.AsyncClient,
+        required_tokens: int,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Uses /tokens/overview and compares locally.
+        """
+        overview = await self.get_token_overview(client, timeout_s=timeout_s, force_fresh=force_fresh)
+        current_balance = int(overview.get("balance") or 0)
+        req = int(required_tokens)
+
+        can_afford = current_balance >= req
         result: Dict[str, Any] = {
             "can_afford": can_afford,
             "current_balance": current_balance,
-            "required": int(required_tokens),
+            "required": req,
         }
-
         if not can_afford:
-            result["shortfall"] = int(required_tokens) - current_balance
-
+            result["shortfall"] = req - current_balance
         return result
 
     # ========================================================================
-    # COST ESTIMATION
+    # TRIAL (entitlement + ledger)
+    # ========================================================================
+
+    async def get_trial_entitlement(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /trial/entitlement
+
+        Expected model: TrialEntitlement row + computed fields (if any).
+        """
+        endpoint = f"{self.base_url}/trial/entitlement"
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
+
+    async def get_trial_ledger(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        skip: int = 0,
+        limit: int = 50,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /trial/ledger?skip=&limit=
+
+        NOTE: You currently had only `limit`.
+        This revision mirrors your token transactions style and common pagination patterns.
+        If your backend doesn't support skip, it will just ignore it.
+        """
+        endpoint = f"{self.base_url}/trial/ledger"
+        skip_i = max(0, int(skip or 0))
+        limit_i = max(1, min(int(limit or 50), 200))
+        params: Dict[str, Any] = {"skip": skip_i, "limit": limit_i}
+
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, list):
+            return {"total": len(data), "entries": data}
+        if isinstance(data, dict):
+            if "items" in data:
+                items = data.get("items") or []
+                return {"total": int(data.get("total") or len(items)), "entries": items}
+            if "entries" in data:
+                items = data.get("entries") or []
+                return {"total": int(data.get("total") or len(items)), "entries": items}
+        return {"total": 0, "entries": []}
+
+    # ========================================================================
+    # STORE (products + orders)
+    # ========================================================================
+
+    async def list_products(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        active_only: bool = True,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /store/products?active_only=1
+
+        Expected: Product rows
+        """
+        endpoint = f"{self.base_url}/store/products"
+        params: Dict[str, Any] = {"active_only": 1 if active_only else 0}
+
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=False),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, list):
+            return {"total": len(data), "products": data}
+        if isinstance(data, dict):
+            if "items" in data:
+                items = data.get("items") or []
+                return {"total": int(data.get("total") or len(items)), "products": items}
+            if "products" in data:
+                items = data.get("products") or []
+                return {"total": int(data.get("total") or len(items)), "products": items}
+        return {"total": 0, "products": []}
+
+    async def list_orders(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        limit: int = 20,
+        skip: int = 0,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /store/orders?limit=&skip=
+
+        Expected: Order rows
+        """
+        endpoint = f"{self.base_url}/store/orders"
+        limit_i = max(1, min(int(limit or 20), 100))
+        skip_i = max(0, int(skip or 0))
+        params: Dict[str, Any] = {"limit": limit_i, "skip": skip_i}
+
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, list):
+            return {"total": len(data), "orders": data}
+        if isinstance(data, dict):
+            if "items" in data:
+                items = data.get("items") or []
+                return {"total": int(data.get("total") or len(items)), "orders": items}
+            if "orders" in data:
+                items = data.get("orders") or []
+                return {"total": int(data.get("total") or len(items)), "orders": items}
+        return {"total": 0, "orders": []}
+
+    async def get_order(
+        self,
+        client: httpx.AsyncClient,
+        order_id: str,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /store/orders/{order_id}
+        """
+        endpoint = f"{self.base_url}/store/orders/{order_id}"
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
+
+    # ========================================================================
+    # COST ESTIMATION + JOBS (existing)
     # ========================================================================
 
     async def estimate_cost(
@@ -138,26 +471,27 @@ class PvizAPIAdapter:
         client: httpx.AsyncClient,
         repo_url: str,
         github_token: Optional[str] = None,
+        *,
+        timeout_s: float = 30.0,
     ) -> Dict[str, Any]:
         """
-        Estimate analysis cost for a repository.
-
-        Endpoint: POST /estimate/github
+        POST /estimate/github
         """
         endpoint = f"{self.base_url}/estimate/github"
         repo_spec = self._parse_repo_url(repo_url)
-
         payload: Dict[str, Any] = {"repo_spec": repo_spec}
         if github_token:
             payload["github_token"] = github_token
 
-        response = await client.post(endpoint, headers=self.get_headers(), json=payload, timeout=30.0)
-        response.raise_for_status()
-        return response.json()
-
-    # ========================================================================
-    # JOB SUBMISSION
-    # ========================================================================
+        resp = await client.post(
+            endpoint,
+            headers=self._headers(force_no_cache=False),
+            json=payload,
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
     async def submit_analysis(
         self,
@@ -168,21 +502,17 @@ class PvizAPIAdapter:
         questions: Optional[List[str]] = None,
         github_token: Optional[str] = None,
         expected_tokens: Optional[int] = None,
+        *,
+        timeout_s: float = 30.0,
     ) -> Dict[str, Any]:
         """
-        Submit a new analysis job.
-
-        Endpoint: POST /jobs/github
-
-        NOTE:
-          - languages is currently NOT USED if your backend doesn’t filter by language yet.
-          - expected_tokens: if None, we estimate first (authoritative on backend anyway, but helps UX).
+        POST /jobs/github
         """
         endpoint = f"{self.base_url}/jobs/github"
         repo_spec = self._parse_repo_url(repo_url)
 
         if expected_tokens is None:
-            estimate = await self.estimate_cost(client, repo_url, github_token)
+            estimate = await self.estimate_cost(client, repo_url, github_token, timeout_s=timeout_s)
             expected_tokens = int(estimate.get("tokens_needed") or 0)
 
         payload: Dict[str, Any] = {
@@ -190,291 +520,243 @@ class PvizAPIAdapter:
             "expected_tokens": expected_tokens,
             "pricing_choice": pricing_choice,
         }
-
         if questions:
             payload["questions"] = questions
         if github_token:
             payload["github_token"] = github_token
+        if languages:
+            payload["languages"] = languages
         if pricing_choice == "trial_credit":
             payload["use_trial_credit_requested"] = True
 
-        response = await client.post(endpoint, headers=self.get_headers(), json=payload, timeout=30.0)
-        response.raise_for_status()
-        return response.json()
+        resp = await client.post(
+            endpoint,
+            headers=self._headers(force_no_cache=False),
+            json=payload,
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
-    # ========================================================================
-    # JOB STATUS
-    # ========================================================================
-
-    async def get_job_status(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
+    async def get_job_status(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Check status of an analysis job.
-
-        Endpoint: GET /jobs/{job_id}
+        GET /jobs/{job_id}
         """
         endpoint = f"{self.base_url}/jobs/{job_id}"
-        response = await client.get(endpoint, headers=self.get_headers(), timeout=30.0)
-        response.raise_for_status()
-        return response.json()
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
-    # ========================================================================
-    # JOB HISTORY
-    # ========================================================================
-
-    async def get_job_history(self, client: httpx.AsyncClient, limit: int = 10, skip: int = 0) -> Dict[str, Any]:
+    async def get_job_history(
+        self,
+        client: httpx.AsyncClient,
+        limit: int = 10,
+        skip: int = 0,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Get recent job history.
-
-        Endpoint: GET /jobs
-
-        Backend often supports pagination via ?skip=&limit=.
-        We pass them through; if backend ignores them, we still slice defensively.
+        GET /jobs?limit=&skip=
         """
         endpoint = f"{self.base_url}/jobs"
+        limit_i = max(1, min(int(limit), 50))
+        skip_i = max(0, int(skip))
 
-        limit = max(1, min(int(limit), 50))
-        skip = max(0, int(skip))
-
-        response = await client.get(
+        resp = await client.get(
             endpoint,
-            headers=self.get_headers(),
-            params={"skip": skip, "limit": limit},
-            timeout=30.0,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache({"skip": skip_i, "limit": limit_i}, force_fresh=force_fresh),
+            timeout=timeout_s,
         )
-        response.raise_for_status()
-        data = response.json()
+        resp.raise_for_status()
+        data = resp.json()
 
-        # Normalize response - backend can return items or jobs
         if isinstance(data, list):
-            jobs = data
-            total = len(data)
-        elif isinstance(data, dict) and "items" in data:
+            return {"total": len(data), "jobs": data[:limit_i]}
+        if isinstance(data, dict) and "items" in data:
             jobs = data.get("items") or []
             total = int(data.get("total") or len(jobs))
-        elif isinstance(data, dict) and "jobs" in data:
+            return {"total": total, "jobs": jobs[:limit_i]}
+        if isinstance(data, dict) and "jobs" in data:
             jobs = data.get("jobs") or []
             total = int(data.get("total") or len(jobs))
-        else:
-            jobs = []
-            total = 0
+            return {"total": total, "jobs": jobs[:limit_i]}
+        return {"total": 0, "jobs": []}
 
-        # Defensive slice
-        jobs = jobs[:limit]
-
-        return {"total": total, "jobs": jobs}
-
-    # ========================================================================
-    # DOWNLOAD RESULTS
-    # ========================================================================
-
-    async def get_download_link(self, client: httpx.AsyncClient, job_id: str) -> Dict[str, Any]:
+    async def cancel_job(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        timeout_s: float = 30.0,
+    ) -> Dict[str, Any]:
         """
-        Get presigned download link for completed job.
+        POST /jobs/{job_id}/cancel
+        """
+        endpoint = f"{self.base_url}/jobs/{job_id}/cancel"
+        resp = await client.post(
+            endpoint,
+            headers=self._headers(force_no_cache=False),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
-        Endpoint: GET /jobs/{job_id}/download-link
+    async def get_download_link(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /jobs/{job_id}/download-link
         """
         endpoint = f"{self.base_url}/jobs/{job_id}/download-link"
-
-        # Add timestamp to force fresh link
-        response = await client.get(
+        params = {"ts": int(time.time())}
+        params = self._maybe_bust_cache(params, force_fresh=force_fresh)
+        resp = await client.get(
             endpoint,
-            headers=self.get_headers(),
-            params={"ts": int(time.time())},
-            timeout=30.0,
+            headers=self._headers(force_no_cache=True),
+            params=params,
+            timeout=timeout_s,
         )
-        response.raise_for_status()
-        return response.json()
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
-    # ========================================================================
-    # GAP FIX: One canonical way to get the artifact URL
-    # ========================================================================
-
-    async def get_artifact_url_for_job(self, client: httpx.AsyncClient, job_id: str) -> Optional[str]:
+    async def get_llm_report(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Canonical artifact URL resolver.
-
-        Your status endpoint does NOT include a presigned URL (per your docstring),
-        so the only reliable way is:
-          1) GET /jobs/{id}   -> confirm status=completed
-          2) GET /jobs/{id}/download-link -> return url
-
-        Returns:
-          - url string if available
-          - None if not completed or no url present
+        GET /jobs/{job_id}/llm-report
         """
-        status = await self.get_job_status(client, job_id)
-        if (status.get("status") or "").lower() != "completed":
-            return None
+        endpoint = f"{self.base_url}/jobs/{job_id}/llm-report"
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
-        dl = await self.get_download_link(client, job_id)
-        url = dl.get("url") or dl.get("s3_url")
-        return url if isinstance(url, str) and url.strip() else None
+    async def get_llm_result(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /jobs/{job_id}/llm-result
+        """
+        endpoint = f"{self.base_url}/jobs/{job_id}/llm-result"
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
+
+    async def get_artifact_links(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        prefer: str = "standard",  # "standard" | "compressed" | "both"
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /jobs/{job_id}/artifact-links?prefer=standard|compressed|both
+
+        If you don't have this endpoint yet, implement it server-side by:
+          - reading Job.artifact_path + Job.artifact_compressed_path
+          - returning presigned URLs for each that exists
+        """
+        endpoint = f"{self.base_url}/jobs/{job_id}/artifact-links"
+        params = {"prefer": prefer}
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
 
     # ========================================================================
-    # HELPER METHODS
+    # Helper methods
     # ========================================================================
 
     def extract_job_id(self, submit_response: Dict[str, Any]) -> str:
-        """Extract job ID from submission response."""
         if "job_id" in submit_response and isinstance(submit_response["job_id"], str):
             return submit_response["job_id"]
-
+        if "id" in submit_response and isinstance(submit_response["id"], str):
+            return submit_response["id"]
         raise ValueError(f"Could not find job_id in response: {submit_response}")
 
-    def extract_s3_url(self, status_response: Dict[str, Any]) -> Optional[str]:
-        """
-        Back-compat helper.
-
-        NOTE: Status response does not include a presigned URL in your backend.
-        Prefer: demonstrate this explicitly by returning None.
-        Server should call get_download_link() or use get_artifact_url_for_job().
-        """
-        return None
-
     def get_job_status_value(self, status_response: Dict[str, Any]) -> str:
-        """
-        Return the backend's real status value as-is (normalized to lowercase).
-
-        IMPORTANT:
-          Do NOT map to "processing/pending" here — the MCP server’s polling logic
-          needs the original statuses to determine terminal states reliably.
-        """
         v = status_response.get("status", "unknown")
         return v.lower() if isinstance(v, str) else "unknown"
 
     def _parse_repo_url(self, repo_url: str) -> Dict[str, Any]:
-        """
-        Parse GitHub URL into repo_spec format.
-
-        Handles:
-        - "owner/repo"
-        - "https://github.com/owner/repo"
-        - "https://github.com/owner/repo/tree/branch"
-        - "https://github.com/owner/repo/tree/branch/subpath"
-        """
         raw = (repo_url or "").strip()
 
-        # Handle "owner/repo" format (no URL)
+        # Handle "owner/repo"
         if "/" in raw and not raw.startswith(("http://", "https://")):
             clean_repo = raw.replace(".git", "")
             return {"provider": "github", "repo": clean_repo}
 
-        # Parse full URL
+        # Parse URL
         try:
             parsed = urlparse(raw)
-
-            # Verify it's GitHub-ish
             host = (parsed.hostname or "").lower()
             if not host or "github.com" not in host:
-                # Not a GitHub URL, treat as repo name
                 return {"provider": "github", "repo": raw}
 
-            # Parse path parts
-            path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-            if len(path_parts) < 2:
+            parts = [p for p in parsed.path.strip("/").split("/") if p]
+            if len(parts) < 2:
                 return {"provider": "github", "repo": raw}
 
-            owner = path_parts[0]
-            repo = path_parts[1].replace(".git", "")
-
+            owner = parts[0]
+            repo = parts[1].replace(".git", "")
             repo_spec: Dict[str, Any] = {"provider": "github", "repo": f"{owner}/{repo}"}
 
-            # Branch + subpath
-            if len(path_parts) >= 4 and path_parts[2] in ("tree", "blob"):
-                repo_spec["branch"] = path_parts[3]
-                if len(path_parts) > 4:
-                    repo_spec["subpath"] = "/".join(path_parts[4:])
+            if len(parts) >= 4 and parts[2] in ("tree", "blob"):
+                repo_spec["branch"] = parts[3]
+                if len(parts) > 4:
+                    repo_spec["subpath"] = "/".join(parts[4:])
 
             return repo_spec
-
         except Exception:
             return {"provider": "github", "repo": raw}
-
-
-# ==============================================================================
-# TESTING YOUR ADAPTER
-# ==============================================================================
-
-async def test_adapter():
-    """Test your API adapter configuration."""
-    adapter = PvizAPIAdapter(
-        base_url=os.getenv("PVIZ_API_URL", "https://api.pvizgenerator.com"),
-        jwt_token=PvizAPIAdapter.load_jwt_token_from_env() or "test-token",
-    )
-
-    print("=" * 60)
-    print("Testing pviz API Adapter")
-    print("=" * 60)
-
-    async with httpx.AsyncClient() as client:
-        # Test 1: Account info
-        print("\n1️⃣  Testing get_account_info (GET /auth/me)...")
-        try:
-            account = await adapter.get_account_info(client)
-            print(f"✅ Account: {account.get('email')} ({account.get('plan')} plan)")
-            print(f"   Verified: {account.get('is_verified')}")
-        except Exception as e:
-            print(f"❌ Failed: {e}")
-            print("   Check your JWT token!")
-            return
-
-        # Test 2: Token balance
-        print("\n2️⃣  Testing get_token_balance (GET /tokens/overview)...")
-        try:
-            balance = await adapter.get_token_balance(client)
-            print(f"✅ Balance: {balance['balance']} tokens")
-            print(f"   Plan: {balance['plan']}")
-            if balance.get("trial"):
-                trial = balance["trial"]
-                print(f"   Trial active: {trial.get('active')}")
-        except Exception as e:
-            print(f"❌ Failed: {e}")
-            return
-
-        # Test 3: Cost estimation
-        print("\n3️⃣  Testing estimate_cost (POST /estimate/github)...")
-        test_repo = "facebook/react"
-        try:
-            estimate = await adapter.estimate_cost(client, test_repo)
-            print(f"✅ Estimate for {test_repo}:")
-            print(f"   Tokens needed: {estimate.get('tokens_needed')}")
-            print(f"   SLOC: {estimate.get('sloc'):,}")
-            print(f"   Files: {estimate.get('file_count')}")
-            print(f"   Can afford: {estimate.get('can_afford')}")
-        except Exception as e:
-            print(f"❌ Failed: {e}")
-            return
-
-        # Test 4: Job history
-        print("\n4️⃣  Testing get_job_history (GET /jobs)...")
-        try:
-            history = await adapter.get_job_history(client, limit=5, skip=0)
-            print(f"✅ Found {history['total']} total jobs")
-            print(f"   Returned jobs: {len(history['jobs'])}")
-            for job in history["jobs"][:3]:
-                print(f"   - {job.get('repo_url')} → {job.get('status')}")
-        except Exception as e:
-            print(f"❌ Failed: {e}")
-            return
-
-        # Test 5: Repo URL parsing
-        print("\n5️⃣  Testing repo URL parsing...")
-        test_urls = [
-            "django/django",
-            "https://github.com/facebook/react",
-            "https://github.com/vuejs/vue/tree/main/src",
-        ]
-        for url in test_urls:
-            spec = adapter._parse_repo_url(url)
-            print(f"✅ {url}")
-            print(f"   → {spec}")
-
-        print("\n" + "=" * 60)
-        print("✅ All tests passed!")
-        print("=" * 60)
-        print("\nAdapter is configured correctly and ready to use.")
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(test_adapter())
