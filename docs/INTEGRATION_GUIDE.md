@@ -94,7 +94,7 @@ See deployment options below based on your infrastructure.
 | Submit job | POST /jobs/github |
 | Job status | GET /jobs/{id} |
 | Job history | GET /jobs |
-| Download link | GET /jobs/{id}/download-link |
+| Download link | GET /jobs/{id}/artifacy-link |
 
 ### Status Mapping
 

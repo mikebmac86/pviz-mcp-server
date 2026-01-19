@@ -65,10 +65,10 @@ class PvizAPIAdapter:
     """
     Adapter for pviz FastAPI backend.
 
-    Additive upgrade:
-      - Single source of truth for JWT sourcing (env or file)
-      - Optional no-cache headers & cache buster support for identity-sensitive GETs
-      - Adds user-relevant API calls aligned to models: tokens ledger, trial, products, orders, jobs detail.
+    Notes:
+      - Artifact URLs should be obtained from:
+          (A) GET /jobs/{id} -> artifact_formats (preferred)
+          (B) GET /jobs/{id}/artifact-links?prefer=... (fallback)
     """
 
     def __init__(
@@ -102,14 +102,7 @@ class PvizAPIAdapter:
             "Content-Type": "application/json",
         }
 
-        # IMPORTANT:
-        # - You often pass force_no_cache=True on identity/billing endpoints.
-        # - That intent should override enable_no_cache_headers.
-        # - enable_no_cache_headers remains a "default on for identity endpoints" knob,
-        #   but callers can still set force_no_cache=True to guarantee behavior.
         if force_no_cache or self.enable_no_cache_headers:
-            # NOTE: still safe on most endpoints; but if you want to only apply
-            # when force_no_cache is True, set enable_no_cache_headers=False.
             headers.update(_default_no_cache_headers())
 
         return headers
@@ -169,11 +162,6 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /tokens/balance
-
-        Returns lightweight:
-          - current_balance
-          - plan
-          - trial (optional)
         """
         endpoint = f"{self.base_url}/tokens/balance"
         resp = await client.get(
@@ -197,9 +185,6 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /tokens/overview
-
-        Normalizes:
-          - balance -> current_balance
         """
         endpoint = f"{self.base_url}/tokens/overview"
         resp = await client.get(
@@ -232,17 +217,10 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /tokens/transactions?skip=&limit=
-
-        Matches your backend `api/tokens.py` signature.
-
-        Returns normalized:
-          - total
-          - transactions (list)
         """
         endpoint = f"{self.base_url}/tokens/transactions"
         skip_i = max(0, int(skip or 0))
         limit_i = max(1, min(int(limit or 50), 200))
-
         params: Dict[str, Any] = {"skip": skip_i, "limit": limit_i}
 
         resp = await client.get(
@@ -254,7 +232,6 @@ class PvizAPIAdapter:
         resp.raise_for_status()
         data = resp.json()
 
-        # Normalize typical patterns
         if isinstance(data, list):
             return {"total": len(data), "transactions": data}
 
@@ -306,8 +283,6 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /trial/entitlement
-
-        Expected model: TrialEntitlement row + computed fields (if any).
         """
         endpoint = f"{self.base_url}/trial/entitlement"
         resp = await client.get(
@@ -331,10 +306,6 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /trial/ledger?skip=&limit=
-
-        NOTE: You currently had only `limit`.
-        This revision mirrors your token transactions style and common pagination patterns.
-        If your backend doesn't support skip, it will just ignore it.
         """
         endpoint = f"{self.base_url}/trial/ledger"
         skip_i = max(0, int(skip or 0))
@@ -375,8 +346,6 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /store/products?active_only=1
-
-        Expected: Product rows
         """
         endpoint = f"{self.base_url}/store/products"
         params: Dict[str, Any] = {"active_only": 1 if active_only else 0}
@@ -412,8 +381,6 @@ class PvizAPIAdapter:
     ) -> Dict[str, Any]:
         """
         GET /store/orders?limit=&skip=
-
-        Expected: Order rows
         """
         endpoint = f"{self.base_url}/store/orders"
         limit_i = max(1, min(int(limit or 20), 100))
@@ -463,7 +430,7 @@ class PvizAPIAdapter:
         return data if isinstance(data, dict) else {"value": data}
 
     # ========================================================================
-    # COST ESTIMATION + JOBS (existing)
+    # COST ESTIMATION + JOBS
     # ========================================================================
 
     async def estimate_cost(
@@ -618,29 +585,100 @@ class PvizAPIAdapter:
         data = resp.json()
         return data if isinstance(data, dict) else {"value": data}
 
-    async def get_download_link(
+    # ------------------------------------------------------------------------
+    # Artifacts (dual-format only; no legacy shim)
+    # ------------------------------------------------------------------------
+
+    async def get_artifact_links(
+        self,
+        client: httpx.AsyncClient,
+        job_id: str,
+        *,
+        prefer: str = "standard",  # "standard" | "compressed" | "both"
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        GET /jobs/{job_id}/artifact-links?prefer=standard|compressed|both
+        """
+        endpoint = f"{self.base_url}/jobs/{job_id}/artifact-links"
+        params = {"prefer": prefer}
+        resp = await client.get(
+            endpoint,
+            headers=self._headers(force_no_cache=True),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {"value": data}
+
+    async def get_job_artifacts(
         self,
         client: httpx.AsyncClient,
         job_id: str,
         *,
         timeout_s: float = 30.0,
         force_fresh: bool = True,
+        prefer: str = "both",  # "standard" | "compressed" | "both"
     ) -> Dict[str, Any]:
         """
-        GET /jobs/{job_id}/download-link
+        Return artifact URLs for both formats (standard + compressed) when possible.
+
+        Resolution order:
+          1) GET /jobs/{id} -> job.artifact_formats (preferred; includes size + ratio)
+          2) GET /jobs/{id}/artifact-links?prefer=... (explicit dual endpoint)
+
+        If neither is available, raises ValueError with guidance.
         """
-        endpoint = f"{self.base_url}/jobs/{job_id}/download-link"
-        params = {"ts": int(time.time())}
-        params = self._maybe_bust_cache(params, force_fresh=force_fresh)
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=params,
-            timeout=timeout_s,
+        # 1) Preferred: job detail (where frontend initiated)
+        job: Optional[Dict[str, Any]] = None
+        try:
+            j = await self.get_job_status(client, job_id, timeout_s=timeout_s, force_fresh=force_fresh)
+            job = j if isinstance(j, dict) else None
+        except Exception:
+            job = None
+
+        if job:
+            af = job.get("artifact_formats")
+            if isinstance(af, dict) and isinstance(af.get("standard"), dict):
+                if prefer == "standard":
+                    af = {"standard": af.get("standard"), "compressed": None}
+                elif prefer == "compressed":
+                    af = {"standard": af.get("standard"), "compressed": af.get("compressed")}
+                return {
+                    "job_id": job_id,
+                    "status": job.get("status"),
+                    "artifact_formats": af,
+                    "source": "job_detail",
+                }
+
+        # 2) Fallback: explicit artifact-links endpoint
+        try:
+            links = await self.get_artifact_links(
+                client, job_id, prefer=prefer, timeout_s=timeout_s, force_fresh=force_fresh
+            )
+            af2 = links.get("artifact_formats")
+            if isinstance(af2, dict) and isinstance(af2.get("standard"), dict):
+                normalized = af2
+            else:
+                normalized = links
+
+            # Basic sanity check
+            if isinstance(normalized, dict) and isinstance(normalized.get("standard"), dict):
+                return {
+                    "job_id": job_id,
+                    "status": None if not job else job.get("status"),
+                    "artifact_formats": normalized,
+                    "source": "artifact_links",
+                }
+        except Exception:
+            pass
+
+        raise ValueError(
+            "No artifact URLs available via /jobs/{id} (artifact_formats) or /jobs/{id}/artifact-links. "
+            "Ensure the backend exposes artifact_formats on job detail and/or implements /artifact-links."
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
 
     async def get_llm_report(
         self,
@@ -680,34 +718,6 @@ class PvizAPIAdapter:
             endpoint,
             headers=self._headers(force_no_cache=True),
             params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
-
-    async def get_artifact_links(
-        self,
-        client: httpx.AsyncClient,
-        job_id: str,
-        *,
-        prefer: str = "standard",  # "standard" | "compressed" | "both"
-        timeout_s: float = 30.0,
-        force_fresh: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        GET /jobs/{job_id}/artifact-links?prefer=standard|compressed|both
-
-        If you don't have this endpoint yet, implement it server-side by:
-          - reading Job.artifact_path + Job.artifact_compressed_path
-          - returning presigned URLs for each that exists
-        """
-        endpoint = f"{self.base_url}/jobs/{job_id}/artifact-links"
-        params = {"prefer": prefer}
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
             timeout=timeout_s,
         )
         resp.raise_for_status()

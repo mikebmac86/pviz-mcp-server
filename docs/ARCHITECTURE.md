@@ -168,7 +168,7 @@ retrieve_result(job_id, include_full_graph=True)
 - `POST /estimate/github` - Cost estimation
 - `POST /jobs/github` - Job submission
 - `GET /jobs/{id}` - Status check
-- `GET /jobs/{id}/download-link` - Artifact download
+- `GET /jobs/{id}/artifact-link` - Artifact download
 - `GET /jobs` - Job history
 
 **Authentication:**
@@ -219,7 +219,7 @@ pviz-artifacts/
 
 **Access:**
 - Presigned URLs (1-hour expiration)
-- Generated on-demand via `/jobs/{id}/download-link`
+- Generated on-demand via `/jobs/{id}/artifact-link`
 - No direct public access
 
 ---

@@ -217,13 +217,13 @@ Authorization: Bearer YOUR_JWT_TOKEN
 
 ---
 
-### GET /jobs/{job_id}/download-link
+### GET /jobs/{job_id}/artifact-link
 
 Returns a presigned S3 URL for downloading the analysis artifact.
 
 **Request:**
 ```http
-GET /jobs/job_a1b2c3d4e5f6/download-link
+GET /jobs/job_a1b2c3d4e5f6/artifact-link
 Authorization: Bearer YOUR_JWT_TOKEN
 ```
 
@@ -969,7 +969,7 @@ All endpoints are rate-limited to ensure fair usage and system stability.
 |----------|-------|--------|--------|
 | POST /estimate/github | 10 requests | 5 minutes | `X-RateLimit-Limit: 10` |
 | POST /jobs/github | 20 requests | 1 hour | `X-RateLimit-Limit: 20` |
-| GET /jobs/{id}/download-link | 10 requests | 1 minute | `X-RateLimit-Limit: 10` |
+| GET /jobs/{id}/artifact-link | 10 requests | 1 minute | `X-RateLimit-Limit: 10` |
 | GET /auth/me | 300 requests | 1 minute | `X-RateLimit-Limit: 300` |
 | GET /jobs | 60 requests | 1 minute | `X-RateLimit-Limit: 60` |
 | GET /jobs/{id} | 120 requests | 1 minute | `X-RateLimit-Limit: 120` |
