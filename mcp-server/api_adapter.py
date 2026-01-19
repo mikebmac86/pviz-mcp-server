@@ -626,8 +626,8 @@ class PvizAPIAdapter:
         Return artifact URLs for both formats (standard + compressed) when possible.
 
         Resolution order:
-          1) GET /jobs/{id} -> job.artifact_formats (preferred; includes size + ratio)
-          2) GET /jobs/{id}/artifact-links?prefer=... (explicit dual endpoint)
+        1) GET /jobs/{id} -> job.artifact_formats (preferred; includes size + ratio)
+        2) GET /jobs/{id}/artifact-links?prefer=... (explicit dual endpoint)
 
         If neither is available, raises ValueError with guidance.
         """
@@ -641,19 +641,30 @@ class PvizAPIAdapter:
 
         if job:
             af = job.get("artifact_formats")
-            if isinstance(af, dict) and isinstance(af.get("standard"), dict):
+            # Check if artifact_formats exists and has at least one format
+            if isinstance(af, dict) and (af.get("standard") or af.get("compressed")):
+                # Filter based on preference
                 if prefer == "standard":
-                    af = {"standard": af.get("standard"), "compressed": None}
+                    result_af = {"standard": af.get("standard"), "compressed": None}
                 elif prefer == "compressed":
-                    af = {"standard": None, "compressed": af.get("compressed")}                
-                elif prefer == "both":
-                    af = {"standard": af.get("standard"), "compressed": af.get("compressed")}
-                return {
-                    "job_id": job_id,
-                    "status": job.get("status"),
-                    "artifact_formats": af,
-                    "source": "job_detail",
-                }
+                    result_af = {"standard": None, "compressed": af.get("compressed")}
+                else:  # "both" or default
+                    result_af = {"standard": af.get("standard"), "compressed": af.get("compressed")}
+                
+                # Validate we got what we requested
+                has_requested = (
+                    (prefer == "standard" and result_af.get("standard")) or
+                    (prefer == "compressed" and result_af.get("compressed")) or
+                    (prefer == "both" and (result_af.get("standard") or result_af.get("compressed")))
+                )
+                
+                if has_requested:
+                    return {
+                        "job_id": job_id,
+                        "status": job.get("status"),
+                        "artifact_formats": result_af,
+                        "source": "job_detail",
+                    }
 
         # 2) Fallback: explicit artifact-links endpoint
         try:
@@ -661,13 +672,13 @@ class PvizAPIAdapter:
                 client, job_id, prefer=prefer, timeout_s=timeout_s, force_fresh=force_fresh
             )
             af2 = links.get("artifact_formats")
-            if isinstance(af2, dict) and isinstance(af2.get("standard"), dict):
+            if isinstance(af2, dict):
                 normalized = af2
             else:
                 normalized = links
 
-            # Basic sanity check
-            if isinstance(normalized, dict) and isinstance(normalized.get("standard"), dict):
+            # Basic sanity check - ensure we have at least one format
+            if isinstance(normalized, dict) and (normalized.get("standard") or normalized.get("compressed")):
                 return {
                     "job_id": job_id,
                     "status": None if not job else job.get("status"),
@@ -681,7 +692,7 @@ class PvizAPIAdapter:
             "No artifact URLs available via /jobs/{id} (artifact_formats) or /jobs/{id}/artifact-links. "
             "Ensure the backend exposes artifact_formats on job detail and/or implements /artifact-links."
         )
-
+        
     async def get_llm_report(
         self,
         client: httpx.AsyncClient,
