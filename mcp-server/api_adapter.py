@@ -11,14 +11,15 @@ import httpx
 
 
 # ==============================================================================
-# Option A: request-scoped bearer (imported from pviz_mcp_http)
+# Option A: request-scoped bearer (imported from auth_context to avoid circulars)
 #   - Hosted MCP: per-user JWT is forwarded via Authorization header to MCP server,
 #     bound to session_id, and exposed via a ContextVar.
 #   - Local MCP: can still use env/file fallback if you want.
 # ==============================================================================
 try:
-    # pviz_mcp_http defines PVIZ_REQUEST_BEARER = ContextVar[Optional[str]]
-    from pviz_mcp_http import PVIZ_REQUEST_BEARER  # type: ignore
+    # auth_context defines PVIZ_REQUEST_BEARER = ContextVar[Optional[str]]
+    # Keep this module dependency-light (no Starlette imports) to avoid circulars.
+    from auth_context import PVIZ_REQUEST_BEARER  # type: ignore
 
     _HAS_REQUEST_BEARER = True
 except Exception:

@@ -19,22 +19,38 @@ Notes:
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import os
 import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from pviz_mcp_server import mcp
+
+# ---------------------------------------------------------------------------
+# Option A: shared request-scoped bearer + session store (single source of truth)
+# ---------------------------------------------------------------------------
+# NOTE:
+#   Keep auth_context dependency-light to avoid circular imports.
+#   auth_context should define:
+#     - PVIZ_REQUEST_BEARER: ContextVar[Optional[str]]
+#     - SESSION_BEARERS:     SessionTokenStore(ttl_s=...)
+#
+# If you're running as a package (e.g. mcp_server.pviz_mcp_http), you may need
+# to switch to: from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS
+try:
+    from auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
+except Exception:
+    # Fallback import path for package layouts
+    from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
+
 
 try:
     from demo_account import DemoAccountMiddleware  # type: ignore
@@ -47,11 +63,6 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Option A: Request-scoped bearer + session binding
 # -----------------------------------------------------------------------------
-
-# Per-request bearer token (the API adapter should read this).
-PVIZ_REQUEST_BEARER: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "PVIZ_REQUEST_BEARER", default=None
-)
 
 
 def _now_s() -> float:
@@ -68,62 +79,6 @@ def _parse_bearer(auth_header: str) -> Optional[str]:
         tok = a.split(" ", 1)[1].strip()
         return tok or None
     return None
-
-
-@dataclass(frozen=True)
-class _SessionToken:
-    token: str
-    expires_at: float
-
-
-class SessionTokenStore:
-    """
-    In-memory session_id -> bearer mapping with TTL.
-
-    WARNING: This is per-process. If you have >1 replica, you must:
-      - enable sticky sessions at the proxy, OR
-      - back this with Redis or similar shared storage.
-    """
-
-    def __init__(self, ttl_s: int = 3600) -> None:
-        self._ttl_s = int(ttl_s)
-        self._lock = asyncio.Lock()
-        self._data: Dict[str, _SessionToken] = {}
-
-    async def set(self, session_id: str, token: str) -> None:
-        if not session_id or not token:
-            return
-        exp = _now_s() + self._ttl_s
-        async with self._lock:
-            self._data[session_id] = _SessionToken(token=token, expires_at=exp)
-
-    async def get(self, session_id: str) -> Optional[str]:
-        if not session_id:
-            return None
-        now = _now_s()
-        async with self._lock:
-            rec = self._data.get(session_id)
-            if rec is None:
-                return None
-            if rec.expires_at <= now:
-                self._data.pop(session_id, None)
-                return None
-            return rec.token
-
-    async def cleanup(self) -> int:
-        now = _now_s()
-        removed = 0
-        async with self._lock:
-            dead = [sid for sid, rec in self._data.items() if rec.expires_at <= now]
-            for sid in dead:
-                self._data.pop(sid, None)
-                removed += 1
-        return removed
-
-
-_SESSION_TOKENS = SessionTokenStore(
-    ttl_s=int(os.getenv("MCP_SESSION_TOKEN_TTL_S", "3600"))
-)
 
 
 class MCPAuthBindMiddleware(BaseHTTPMiddleware):
@@ -148,11 +103,11 @@ class MCPAuthBindMiddleware(BaseHTTPMiddleware):
 
         # Bind token when present
         if bearer and session_id:
-            await _SESSION_TOKENS.set(session_id, bearer)
+            await SESSION_BEARERS.set(session_id, bearer)
 
         # Fallback: if token missing but we have session_id, try store
         if (not bearer) and session_id:
-            bearer = await _SESSION_TOKENS.get(session_id)
+            bearer = await SESSION_BEARERS.get(session_id)
 
         # Set request-scoped bearer for the rest of the call stack
         token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
@@ -176,9 +131,9 @@ class MCPAuthBindMiddleware(BaseHTTPMiddleware):
             PVIZ_REQUEST_BEARER.reset(token_ctx)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Existing helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -581,6 +536,32 @@ if DEMO_AVAILABLE:
 
 print(f"[pviz_mcp_http] Server initialization complete", file=sys.stderr)
 print(file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Optional cleanup loop (safe, off by default)
+# ---------------------------------------------------------------------------
+async def _cleanup_loop() -> None:
+    every_s = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
+    if every_s <= 0:
+        return
+    while True:
+        try:
+            removed = await SESSION_BEARERS.cleanup()
+            if _bool_env("MCP_DEBUG_AUTH_BIND", False):
+                print(f"[pviz_mcp_http] AUTH_BIND cleanup removed={removed}", file=sys.stderr)
+        except Exception as e:
+            print(f"[pviz_mcp_http] AUTH_BIND cleanup error: {type(e).__name__}: {e}", file=sys.stderr)
+        await asyncio.sleep(every_s)
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    # Start cleanup loop only if configured
+    every_s = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
+    if every_s > 0:
+        asyncio.create_task(_cleanup_loop())
+
 
 if __name__ == "__main__":
     import uvicorn
