@@ -251,6 +251,7 @@ class Bridge:
             timeout=httpx.Timeout(self.timeout_s),
             follow_redirects=True,
             http2=http2,
+            trust_env=False,   # <--- IMPORTANT
         )
 
         _log(

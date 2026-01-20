@@ -11,6 +11,22 @@ import httpx
 
 
 # ==============================================================================
+# Option A: request-scoped bearer (imported from pviz_mcp_http)
+#   - Hosted MCP: per-user JWT is forwarded via Authorization header to MCP server,
+#     bound to session_id, and exposed via a ContextVar.
+#   - Local MCP: can still use env/file fallback if you want.
+# ==============================================================================
+try:
+    # pviz_mcp_http defines PVIZ_REQUEST_BEARER = ContextVar[Optional[str]]
+    from pviz_mcp_http import PVIZ_REQUEST_BEARER  # type: ignore
+
+    _HAS_REQUEST_BEARER = True
+except Exception:
+    PVIZ_REQUEST_BEARER = None  # type: ignore
+    _HAS_REQUEST_BEARER = False
+
+
+# ==============================================================================
 # Token loading (single source of truth) + non-sensitive fingerprinting
 # ==============================================================================
 
@@ -65,6 +81,11 @@ class PvizAPIAdapter:
     """
     Adapter for pviz FastAPI backend.
 
+    Option A behavior:
+      - Prefer *per-request* bearer token (from PVIZ_REQUEST_BEARER) if available.
+      - Fall back to explicit jwt_token passed to __init__.
+      - Fall back to env/file only if allow_env_fallback=True.
+
     Notes:
       - Artifact URLs should be obtained from:
           (A) GET /jobs/{id} -> artifact_formats (preferred)
@@ -78,26 +99,75 @@ class PvizAPIAdapter:
         *,
         allow_env_fallback: bool = True,
         enable_no_cache_headers: bool = True,
+        prefer_request_bearer: bool = True,
+        require_request_bearer: bool = False,
     ):
         self.base_url = (base_url or "").rstrip("/")
+        self.enable_no_cache_headers = bool(enable_no_cache_headers)
 
+        # Used only as fallback (local mode or misconfigured request auth)
         tok = (jwt_token or "").strip()
-        src = "explicit"
-        if not tok:
-            if not allow_env_fallback:
-                raise ValueError("jwt_token was not provided and allow_env_fallback=False")
-            tok, src = load_jwt_token_with_source()
+        src = "explicit" if tok else "none"
+
+        # Env/file fallback (optional)
+        if not tok and allow_env_fallback:
+            try:
+                tok, src = load_jwt_token_with_source()
+            except Exception:
+                tok, src = "", "none"
 
         self.jwt_token = tok
-        self.jwt_source = src  # 'explicit' | 'env' | 'file'
-        self.enable_no_cache_headers = bool(enable_no_cache_headers)
+        self.jwt_source = src  # 'explicit' | 'env' | 'file' | 'none'
+
+        self.prefer_request_bearer = bool(prefer_request_bearer)
+        self.require_request_bearer = bool(require_request_bearer)
+
+    # ------------------------------------------------------------------
+    # Token selection
+    # ------------------------------------------------------------------
+    def _get_request_bearer(self) -> Optional[str]:
+        if not _HAS_REQUEST_BEARER:
+            return None
+        try:
+            v = PVIZ_REQUEST_BEARER.get()  # type: ignore[attr-defined]
+            if v and isinstance(v, str) and v.strip():
+                return v.strip()
+        except Exception:
+            pass
+        return None
+
+    def _choose_token(self) -> Tuple[str, str]:
+        """
+        Returns (token, source) where source is:
+          - "request" if per-request bearer is available
+          - otherwise self.jwt_source
+        """
+        req_tok = self._get_request_bearer() if self.prefer_request_bearer else None
+        if req_tok:
+            return req_tok, "request"
+
+        if self.require_request_bearer:
+            raise ValueError(
+                "No per-request bearer token available. "
+                "Hosted MCP (Option A) requires clients to send Authorization: Bearer <PVIZ_JWT_TOKEN> "
+                "to the MCP server so it can be forwarded to the backend."
+            )
+
+        if self.jwt_token and self.jwt_token.strip():
+            return self.jwt_token.strip(), self.jwt_source
+
+        raise ValueError(
+            "JWT not configured: no per-request bearer available and no fallback token set. "
+            "Set PVIZ_JWT_TOKEN (local) or ensure the MCP client sends Authorization: Bearer <token> (remote)."
+        )
 
     # ------------------------------------------------------------------
     # Headers / params helpers
     # ------------------------------------------------------------------
     def _headers(self, *, force_no_cache: bool = False) -> Dict[str, str]:
+        tok, _src = self._choose_token()
         headers: Dict[str, str] = {
-            "Authorization": f"Bearer {self.jwt_token}",
+            "Authorization": f"Bearer {tok}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -116,13 +186,35 @@ class PvizAPIAdapter:
     def debug_token_info(self) -> Dict[str, Any]:
         """
         Non-sensitive debug info to confirm which JWT and API base URL the MCP server is using.
+
+        IMPORTANT:
+          - If a request-scoped token exists, it will be reported as token_source="request"
+            with its own fingerprint.
+          - Otherwise it reports the configured fallback token.
         """
-        return {
+        info: Dict[str, Any] = {
             "base_url": self.base_url,
-            "token_source": self.jwt_source,
-            "token_fingerprint": token_fingerprint(self.jwt_token),
             "no_cache_headers_enabled": self.enable_no_cache_headers,
+            "prefer_request_bearer": self.prefer_request_bearer,
+            "require_request_bearer": self.require_request_bearer,
+            "request_bearer_supported": _HAS_REQUEST_BEARER,
         }
+
+        try:
+            tok, src = self._choose_token()
+            info["token_source"] = src
+            info["token_fingerprint"] = token_fingerprint(tok)
+        except Exception as e:
+            info["token_source"] = "none"
+            info["token_fingerprint"] = "none"
+            info["token_error"] = f"{type(e).__name__}: {e}"
+
+        # Also include fallback fingerprint (useful to detect accidental env/file use)
+        if self.jwt_token:
+            info["fallback_token_source"] = self.jwt_source
+            info["fallback_token_fingerprint"] = token_fingerprint(self.jwt_token)
+
+        return info
 
     # ========================================================================
     # ACCOUNT
@@ -650,14 +742,14 @@ class PvizAPIAdapter:
                     result_af = {"standard": None, "compressed": af.get("compressed")}
                 else:  # "both" or default
                     result_af = {"standard": af.get("standard"), "compressed": af.get("compressed")}
-                
+
                 # Validate we got what we requested
                 has_requested = (
-                    (prefer == "standard" and result_af.get("standard")) or
-                    (prefer == "compressed" and result_af.get("compressed")) or
-                    (prefer == "both" and (result_af.get("standard") or result_af.get("compressed")))
+                    (prefer == "standard" and result_af.get("standard"))
+                    or (prefer == "compressed" and result_af.get("compressed"))
+                    or (prefer == "both" and (result_af.get("standard") or result_af.get("compressed")))
                 )
-                
+
                 if has_requested:
                     return {
                         "job_id": job_id,
@@ -692,7 +784,7 @@ class PvizAPIAdapter:
             "No artifact URLs available via /jobs/{id} (artifact_formats) or /jobs/{id}/artifact-links. "
             "Ensure the backend exposes artifact_formats on job detail and/or implements /artifact-links."
         )
-        
+
     async def get_llm_report(
         self,
         client: httpx.AsyncClient,
