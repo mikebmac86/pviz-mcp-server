@@ -31,34 +31,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
-
 from pviz_mcp_server import mcp
-
-# ---------------------------------------------------------------------------
-# Option A: shared request-scoped bearer + session store (single source of truth)
-# ---------------------------------------------------------------------------
-# NOTE:
-#   Keep auth_context dependency-light to avoid circular imports.
-#   auth_context should define:
-#     - PVIZ_REQUEST_BEARER: ContextVar[Optional[str]]
-#     - SESSION_BEARERS:     SessionTokenStore(ttl_s=...)
-#
-# If you're running as a package (e.g. mcp_server.pviz_mcp_http), you may need
-# to switch to: from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS
-try:
-    from auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
-except Exception:
-    # Fallback import path for package layouts
-    from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
-
-
-try:
-    from demo_account import DemoAccountMiddleware  # type: ignore
-
-    DEMO_AVAILABLE = True
-except Exception:
-    DEMO_AVAILABLE = False
-
+from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
 
 # -----------------------------------------------------------------------------
 # Option A: Request-scoped bearer + session binding
@@ -67,7 +41,6 @@ except Exception:
 
 def _now_s() -> float:
     return time.time()
-
 
 def _parse_bearer(auth_header: str) -> Optional[str]:
     if not auth_header:
@@ -529,10 +502,6 @@ if cors_origins:
         allow_headers=["*"],
     )
     print(f"[pviz_mcp_http] CORS enabled for origins: {cors_origins}", file=sys.stderr)
-
-if DEMO_AVAILABLE:
-    app.add_middleware(DemoAccountMiddleware)
-    print(f"[pviz_mcp_http] DemoAccountMiddleware enabled", file=sys.stderr)
 
 print(f"[pviz_mcp_http] Server initialization complete", file=sys.stderr)
 print(file=sys.stderr)

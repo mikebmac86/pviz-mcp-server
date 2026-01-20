@@ -10,22 +10,9 @@ from urllib.parse import urlparse
 import httpx
 
 
-# ==============================================================================
-# Option A: request-scoped bearer (imported from auth_context to avoid circulars)
-#   - Hosted MCP: per-user JWT is forwarded via Authorization header to MCP server,
-#     bound to session_id, and exposed via a ContextVar.
-#   - Local MCP: can still use env/file fallback if you want.
-# ==============================================================================
-try:
-    # auth_context defines PVIZ_REQUEST_BEARER = ContextVar[Optional[str]]
-    # Keep this module dependency-light (no Starlette imports) to avoid circulars.
-    from auth_context import PVIZ_REQUEST_BEARER  # type: ignore
+from .auth_context import PVIZ_REQUEST_BEARER  # type: ignore
 
-    _HAS_REQUEST_BEARER = True
-except Exception:
-    PVIZ_REQUEST_BEARER = None  # type: ignore
-    _HAS_REQUEST_BEARER = False
-
+_HAS_REQUEST_BEARER = True
 
 # ==============================================================================
 # Token loading (single source of truth) + non-sensitive fingerprinting
