@@ -229,7 +229,6 @@ class Bridge:
             headers=headers,
             timeout=httpx.Timeout(self.timeout_s),
             follow_redirects=True,
-            http2=True,
         )
 
         _log("remote_base=", self.remote_base)
