@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 
 
-from .auth_context import PVIZ_REQUEST_BEARER  # type: ignore
+from auth_context import PVIZ_REQUEST_BEARER  # type: ignore
 
 _HAS_REQUEST_BEARER = True
 
