@@ -19,7 +19,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Route, Mount
 from starlette.middleware.cors import CORSMiddleware
-
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pviz_mcp_server import mcp
 
 try:
@@ -96,6 +96,20 @@ routes = [
 ]
 
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
+
+# ---------------------------------------------------------------------------
+# Host allowlist (fixes "Invalid Host header" from the MCP SSE transport)
+# ---------------------------------------------------------------------------
+allowed_hosts_env = os.getenv(
+    "ALLOWED_HOSTS",
+    "mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server",
+)
+allowed_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=allowed_hosts,
+)
 
 # CORS only if explicitly configured
 cors_origins = os.getenv("CORS_ORIGINS")

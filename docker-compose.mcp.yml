@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      PVIZ_API_URL: http://host.docker.internal:8000
+      PVIZ_API_URL: http://api:8000
       PVIZ_JWT_TOKEN_FILE: /run/secrets/mcp_jwt_token
       PORT: 8080
       HOST: 0.0.0.0
