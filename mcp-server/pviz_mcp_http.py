@@ -239,6 +239,50 @@ async def oauth_not_supported(request):
         status_code=404,
     )
 
+class DebugMcpMessagesMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        path = scope.get("path", "")
+        if path.startswith("/mcp/messages"):
+            # capture headers
+            headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+            method = scope.get("method", "?")
+            qs = scope.get("query_string", b"").decode(errors="replace")
+
+            # drain full body
+            chunks = []
+            more = True
+            while more:
+                msg = await receive()
+                if msg["type"] != "http.request":
+                    continue
+                chunks.append(msg.get("body", b""))
+                more = msg.get("more_body", False)
+
+            body = b"".join(chunks)
+            preview = body[:300].decode(errors="replace")
+
+            print(f"[pviz_mcp_http] DEBUG {method} {path}?{qs}", file=sys.stderr)
+            print(f"[pviz_mcp_http] DEBUG headers: content-type={headers.get('content-type')} len={headers.get('content-length')}", file=sys.stderr)
+            print(f"[pviz_mcp_http] DEBUG body_len={len(body)} body_preview={preview!r}", file=sys.stderr)
+
+            # replay body to downstream app
+            sent = False
+            async def replay_receive():
+                nonlocal sent
+                if sent:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            return await self.app(scope, replay_receive, send)
+
+        return await self.app(scope, receive, send)
 
 # ---------------------------------------------------------------------------
 # Configure MCP transport security BEFORE creating the MCP ASGI app
@@ -247,7 +291,7 @@ _configure_mcp_transport_security()
 
 # MCP SDK SSE ASGI app (this is what clients talk to at /mcp/*)
 print(f"[pviz_mcp_http] Creating SSE app from mcp.sse_app()...", file=sys.stderr)
-mcp_asgi_app = mcp.sse_app()
+mcp_asgi_app = DebugMcpMessagesMiddleware(mcp.sse_app())
 print(f"[pviz_mcp_http] SSE app created: {type(mcp_asgi_app)}", file=sys.stderr)
 
 routes = [
