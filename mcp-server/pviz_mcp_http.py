@@ -15,6 +15,7 @@ Deploy behind Caddy or any reverse proxy.
 from __future__ import annotations
 
 import os
+from typing import List
 
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
@@ -39,11 +40,93 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _split_csv_env(name: str, default: str = "") -> list[str]:
+def _split_csv_env(name: str, default: str = "") -> List[str]:
     v = os.getenv(name, default).strip()
     if not v:
         return []
     return [p.strip() for p in v.split(",") if p.strip()]
+
+
+def _expand_host_variants(hosts: List[str]) -> List[str]:
+    """
+    Some host validators treat "example.com" and "example.com:443" differently.
+    Also, some support a port wildcard like "example.com:*".
+    We include a few variants defensively.
+    """
+    out: List[str] = []
+    for h in hosts:
+        if not h:
+            continue
+        out.append(h)
+
+        # If host has no port, add a wildcard-port variant (if the SDK supports it)
+        if ":" not in h and h != "*":
+            out.append(f"{h}:*")
+            out.append(f"{h}:443")
+            out.append(f"{h}:80")
+
+    # De-dupe preserving order
+    seen = set()
+    deduped: List[str] = []
+    for h in out:
+        if h not in seen:
+            seen.add(h)
+            deduped.append(h)
+    return deduped
+
+
+def _configure_mcp_transport_security() -> None:
+    """
+    IMPORTANT:
+    The MCP Python SDK has its own transport security validation which is what
+    is producing the 421 + "Invalid Host header" logs.
+
+    We must configure MCP's transport security allowed hosts (and optionally origins).
+    """
+    # Debug escape hatch (do NOT leave enabled in production)
+    allow_any = _bool_env("PVIZ_ALLOW_ANY_HOST", False)
+
+    # Defaults that match your deployment
+    default_hosts = "mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server"
+    default_origins = "https://mcp.pvizgenerator.com"
+
+    allowed_hosts = _split_csv_env("MCP_ALLOWED_HOSTS", default=default_hosts)
+    allowed_origins = _split_csv_env("MCP_ALLOWED_ORIGINS", default=default_origins)
+
+    if allow_any:
+        allowed_hosts = ["*"]
+        allowed_origins = ["*"]
+
+    allowed_hosts = _expand_host_variants(allowed_hosts)
+
+    # The MCP SDK uses TransportSecuritySettings on the FastMCP settings.
+    # This code assumes pviz_mcp_server.mcp is a FastMCP instance (as your traceback shows).
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings  # type: ignore
+
+        ts = TransportSecuritySettings(
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+            # If the SDK supports this flag, keep it enabled by default.
+            # You can disable temporarily with MCP_ENABLE_DNS_REBINDING_PROTECTION=0
+            enable_dns_rebinding_protection=_bool_env(
+                "MCP_ENABLE_DNS_REBINDING_PROTECTION", True
+            ),
+        )
+
+        # Assign onto the FastMCP settings object
+        if hasattr(mcp, "settings") and hasattr(mcp.settings, "transport_security"):
+            mcp.settings.transport_security = ts  # type: ignore[attr-defined]
+        elif hasattr(mcp, "_settings") and hasattr(mcp._settings, "transport_security"):
+            mcp._settings.transport_security = ts  # type: ignore[attr-defined]
+        else:
+            # Last-resort: attempt direct attribute
+            setattr(mcp, "transport_security", ts)
+
+    except Exception as e:
+        # If this fails, we *still* want the app to boot (so you can see logs),
+        # but SSE will likely keep failing until the SDK config is applied.
+        print(f"[pviz_mcp_http] WARN: failed to configure MCP transport security: {e!r}")
 
 
 async def health_check(request):
@@ -71,11 +154,9 @@ async def info_endpoint(request):
 
 
 async def mcp_redirect(request):
-    # Ensure /mcp works even if the transport expects /mcp/
     return RedirectResponse(url="/mcp/", status_code=307)
 
 
-# Optional: respond explicitly to OAuth discovery probes (some clients check these)
 async def oauth_not_supported(request):
     return JSONResponse(
         {
@@ -87,62 +168,40 @@ async def oauth_not_supported(request):
 
 
 # ---------------------------------------------------------------------------
-# Host allowlist (fixes 421 / "Invalid Host header" behind proxies)
-#
-# IMPORTANT:
-#   /mcp/* is served by the mounted MCP transport app (mcp.sse_app()).
-#   Middleware added to the outer Starlette `app` does NOT affect the mounted app.
-#   Therefore we must wrap BOTH:
-#     1) the mounted mcp_asgi_app
-#     2) the outer Starlette app (optional but fine)
+# Configure MCP transport security BEFORE creating the MCP ASGI app
 # ---------------------------------------------------------------------------
-allowed_hosts = _split_csv_env(
-    "ALLOWED_HOSTS",
-    default="mcp.pvizgenerator.com,mcp.pvizgenerator.com:443,localhost,127.0.0.1,pviz-mcp-server",
-)
+_configure_mcp_transport_security()
 
-# Optional: allow any host (NOT recommended) for debugging only.
-# Set PVIZ_ALLOW_ANY_HOST=1 temporarily if needed.
-if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
-    allowed_hosts = ["*"]
-
-# MCP SDK SSE ASGI app (this is what mcp-remote expects to talk to at /mcp/*)
+# MCP SDK SSE ASGI app (this is what clients talk to at /mcp/*)
 mcp_asgi_app = mcp.sse_app()
-
-# Wrap the mounted MCP transport app (critical fix for /mcp/sse 421)
-if allowed_hosts:
-    mcp_asgi_app = TrustedHostMiddleware(mcp_asgi_app, allowed_hosts=allowed_hosts)
 
 routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
     Route("/", endpoint=info_endpoint, methods=["GET"]),
-    # Make /mcp a redirect, and let the mounted transport handle /mcp/*
     Route("/mcp", endpoint=mcp_redirect, methods=["GET"]),
-    # Optional OAuth probe endpoints
-    Route(
-        "/.well-known/oauth-protected-resource",
-        endpoint=oauth_not_supported,
-        methods=["GET"],
-    ),
-    Route(
-        "/.well-known/oauth-protected-resource/mcp",
-        endpoint=oauth_not_supported,
-        methods=["GET"],
-    ),
-    Route(
-        "/.well-known/oauth-authorization-server",
-        endpoint=oauth_not_supported,
-        methods=["GET"],
-    ),
-    # Mount MCP transport under /mcp (handles /mcp/sse and /mcp/messages)
+    Route("/.well-known/oauth-protected-resource", endpoint=oauth_not_supported, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource/mcp", endpoint=oauth_not_supported, methods=["GET"]),
+    Route("/.well-known/oauth-authorization-server", endpoint=oauth_not_supported, methods=["GET"]),
     Mount("/mcp", app=mcp_asgi_app),
 ]
 
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
 
-# Optionally also protect the outer app endpoints (/ and /health, etc.)
-if allowed_hosts:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+# ---------------------------------------------------------------------------
+# Starlette Host allowlist (nice to keep consistent, but MCP SDK is the real gate)
+# ---------------------------------------------------------------------------
+starlette_allowed_hosts = _split_csv_env(
+    "ALLOWED_HOSTS",
+    default="mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server",
+)
+if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
+    starlette_allowed_hosts = ["*"]
+
+if starlette_allowed_hosts:
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=_expand_host_variants(starlette_allowed_hosts),
+    )
 
 # ---------------------------------------------------------------------------
 # CORS only if explicitly configured
