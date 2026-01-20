@@ -265,26 +265,31 @@ async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
 
     raise PvizAPIError("Polling timeout")
 
-
-def _pick_artifact_url(artifact_formats: Dict[str, Any], *, prefer: str) -> Optional[str]:
+def _pick_artifact_url(artifact_formats: Dict[str, Any], *, prefer: str) -> tuple[Optional[str], str]:
     """
-    prefer: "standard" | "compressed"
-    artifact_formats shape:
-      {
-        "standard": {"url": ...},
-        "compressed": {"url": ...} | None
-      }
+    Returns: (url, actual_format_used)
+    Raises: PvizAPIError if requested format is missing
     """
     if not isinstance(artifact_formats, dict):
-        return None
+        return None, "none"
 
     std = artifact_formats.get("standard") if isinstance(artifact_formats.get("standard"), dict) else None
     cmp_ = artifact_formats.get("compressed") if isinstance(artifact_formats.get("compressed"), dict) else None
 
     if prefer == "compressed":
-        return (cmp_ or {}).get("url") or (std or {}).get("url")
-    return (std or {}).get("url") or (cmp_ or {}).get("url")
-
+        if not cmp_:
+            raise PvizAPIError(
+                f"Compressed artifact requested but not available. "
+                f"Standard exists: {std is not None}. This indicates a job processing bug."
+            )
+        return cmp_.get("url"), "compressed"
+    
+    if not std:
+        raise PvizAPIError(
+            f"Standard artifact requested but not available. "
+            f"Compressed exists: {cmp_ is not None}. This indicates a job processing bug."
+        )
+    return std.get("url"), "standard"
 
 # =============================================================================
 # MCP TOOLS - CACHE / DEBUG
