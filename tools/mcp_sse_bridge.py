@@ -2,29 +2,26 @@
 """
 MCP stdio <-> MCP remote (HTTP/SSE) bridge for Claude Desktop.
 
-Why this exists:
-- Claude Desktop expects MCP servers over stdio (command/args).
-- Your PViz MCP server is deployed remotely over HTTP/SSE at:
-    https://mcp.pvizgenerator.com/mcp
+Remote MCP (PViz):
+  - SSE:      GET  {MCP_REMOTE_URL}/sse
+  - Messages: POST {origin}{endpoint_from_sse}
 
-This bridge:
-- Speaks MCP stdio framing (Content-Length headers) to Claude.
-- Establishes an SSE session to the remote MCP server (/mcp/sse).
-- Receives the session-specific messages endpoint from the SSE "endpoint" event.
-- Forwards every stdio JSON-RPC message to the remote via POST /mcp/messages/?session_id=...
-- Forwards remote JSON-RPC responses/notifications back to stdio from:
-    (a) SSE stream events (data: {json})
-    (b) POST response body if it's JSON (IMPORTANT for initialize in some servers)
+Key behavior:
+  - Claude talks stdio (Content-Length framed JSON-RPC).
+  - Remote talks SSE + POST with a session-bound endpoint.
+  - POST usually returns 202 Accepted; real JSON-RPC responses arrive over SSE.
 
 Env vars:
-- MCP_REMOTE_URL: base remote MCP path (default: https://mcp.pvizgenerator.com/mcp)
-- PVIZ_JWT_TOKEN: bearer token for Authorization (optional but typical)
-- MCP_HTTP_TIMEOUT_S: http timeout seconds (default: 60)
-- MCP_SSE_RECONNECT_S: reconnect delay seconds (default: 1.5)
-- MCP_DEBUG: set to "1" for stderr debug logs
+  - MCP_REMOTE_URL: base remote MCP path (default: https://mcp.pvizgenerator.com/mcp)
+  - PVIZ_JWT_TOKEN: bearer token for Authorization (optional)
+  - MCP_HTTP_TIMEOUT_S: http timeout seconds (default: 60)
+  - MCP_SSE_RECONNECT_S: reconnect delay seconds (default: 1.5)
+  - MCP_HTTP2: "1" to enable http2 (default: 0)
+  - MCP_DEBUG: "1" to enable verbose stderr logs (default: 0)
 
 Dependencies:
-- pip install httpx
+  - pip install httpx
+  - optional for http2: pip install "httpx[http2]"
 """
 
 from __future__ import annotations
@@ -40,7 +37,7 @@ import httpx
 
 
 # ---------------------------
-# Logging (stderr shows in Claude MCP logs)
+# Debug logging (stderr only)
 # ---------------------------
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -53,9 +50,13 @@ def _bool_env(name: str, default: bool = False) -> bool:
 DEBUG = _bool_env("MCP_DEBUG", False)
 
 
-def _log(*parts: Any) -> None:
-    if DEBUG:
+def _log(*parts: object) -> None:
+    if not DEBUG:
+        return
+    try:
         print("[pviz-bridge]", *parts, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 # ---------------------------
@@ -88,11 +89,13 @@ def stdio_read_message(stdin_buf) -> Optional[Dict[str, Any]]:
 
     cl_raw = headers.get("content-length")
     if not cl_raw:
+        _log("stdin: missing content-length header:", headers)
         return None
 
     try:
         content_length = int(cl_raw)
     except ValueError:
+        _log("stdin: invalid content-length:", cl_raw)
         return None
 
     body = stdin_buf.read(content_length)
@@ -100,16 +103,23 @@ def stdio_read_message(stdin_buf) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        return json.loads(body.decode("utf-8"))
-    except Exception:
+        msg = json.loads(body.decode("utf-8"))
+        return msg
+    except Exception as e:
+        _log("stdin: json parse error:", repr(e), "raw=", body[:200])
+        # Surface parse error as notification (best effort)
         return {
             "jsonrpc": "2.0",
-            "method": "mcp.bridge.parse_error",
-            "params": {"raw": body.decode("utf-8", "replace")},
+            "method": "notifications/message",
+            "params": {"level": "error", "message": "bridge: failed to parse stdin JSON"},
         }
 
 
 def stdio_write_message(stdout_buf, msg: Dict[str, Any]) -> None:
+    """
+    Writes one JSON-RPC object to stdout with MCP/LSP Content-Length framing.
+    MUST NOT write anything else to stdout.
+    """
     data = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     header = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
     stdout_buf.write(header)
@@ -133,18 +143,19 @@ async def _aiter_sse_events(resp: httpx.Response):
     Yields SSEEvent(event, data).
     """
     event_type = ""
-    data_lines = []
+    data_lines: list[str] = []
 
     async for raw_line in resp.aiter_lines():
         if raw_line is None:
             continue
         line = raw_line.rstrip("\r")
 
-        # Comment/ping line starts with ":"
+        # Comment/ping line starts with ":" (keepalives)
         if line.startswith(":"):
             continue
 
         if line == "":
+            # dispatch
             if data_lines or event_type:
                 yield SSEEvent(event=event_type or "message", data="\n".join(data_lines))
             event_type = ""
@@ -156,8 +167,10 @@ async def _aiter_sse_events(resp: httpx.Response):
             continue
 
         if line.startswith("data:"):
-            data_lines.append(line[len("data:"):].strip())
+            data_lines.append(line[len("data:"):].lstrip())
             continue
+
+        # ignore id:, retry:, etc.
 
 
 def _env_float(name: str, default: float) -> float:
@@ -179,21 +192,15 @@ def _env_str(name: str, default: str) -> str:
 
 def _build_urls(remote_base: str) -> Tuple[str, str]:
     """
-    remote_base is expected like:
-      https://mcp.pvizgenerator.com/mcp
-    Returns:
-      (sse_url, origin)
+    remote_base expected like https://mcp.pvizgenerator.com/mcp
+    Returns (sse_url, origin)
     """
     base = remote_base.rstrip("/")
-    if base.endswith("/mcp/sse"):
-        base = base[: -len("/sse")]
-    elif base.endswith("/sse"):
-        base = base[: -len("/sse")]
-
     if not base.endswith("/mcp"):
-        # If user provided just https://host, append /mcp
-        base = base + "/mcp"
-
+        if base.endswith("/mcp/sse"):
+            base = base[: -len("/sse")]
+        elif base.endswith("/sse"):
+            base = base[: -len("/sse")]
     sse_url = f"{base}/sse"
 
     u = httpx.URL(base)
@@ -211,6 +218,8 @@ class Bridge:
         self.reconnect_s = _env_float("MCP_SSE_RECONNECT_S", 1.5)
 
         self.sse_url, self.origin = _build_urls(self.remote_base)
+
+        # Important: do NOT clear messages_url on reconnect; keep last known until replaced.
         self.messages_url: Optional[str] = None
 
         self._stop = asyncio.Event()
@@ -218,21 +227,24 @@ class Bridge:
 
         headers = {
             "accept": "text/event-stream",
-            "user-agent": "pviz-mcp-stdio-bridge/1.1",
-            # Some servers enforce Origin for host/dns-rebinding protections.
-            "origin": self.origin,
+            "user-agent": "pviz-mcp-stdio-bridge/1.2",
         }
         if self.jwt:
             headers["authorization"] = f"Bearer {self.jwt}"
+
+        http2 = _bool_env("MCP_HTTP2", False)
 
         self._client = httpx.AsyncClient(
             headers=headers,
             timeout=httpx.Timeout(self.timeout_s),
             follow_redirects=True,
+            http2=http2,
         )
 
-        _log("remote_base=", self.remote_base)
-        _log("sse_url=", self.sse_url, "origin=", self.origin)
+        _log("BOOT",
+             "remote_base=", self.remote_base,
+             "sse_url=", self.sse_url,
+             "http2=", http2)
 
     async def close(self) -> None:
         self._stop.set()
@@ -253,6 +265,7 @@ class Bridge:
                 raise exc
 
     async def _ensure_messages_url(self) -> str:
+        # Wait until SSE provides an endpoint at least once.
         while not self.messages_url and not self._stop.is_set():
             await asyncio.sleep(0.01)
         if not self.messages_url:
@@ -262,11 +275,9 @@ class Bridge:
     async def _remote_sse_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                _log("connecting SSE:", self.sse_url)
+                _log("SSE connect ->", self.sse_url)
                 async with self._client.stream("GET", self.sse_url) as resp:
                     resp.raise_for_status()
-
-                    self.messages_url = None
 
                     async for ev in _aiter_sse_events(resp):
                         if self._stop.is_set():
@@ -278,7 +289,7 @@ class Bridge:
                                 self.messages_url = path
                             else:
                                 self.messages_url = f"{self.origin}{path}"
-                            _log("SSE endpoint:", self.messages_url)
+                            _log("SSE endpoint =", self.messages_url)
                             continue
 
                         data = ev.data.strip()
@@ -287,53 +298,36 @@ class Bridge:
 
                         try:
                             msg = json.loads(data)
-                        except Exception:
-                            continue
+                            _log("SSE <-", "id=", msg.get("id"), "method=", msg.get("method"))
+                            await self._remote_out_q.put(msg)
+                        except Exception as e:
+                            _log("SSE json parse failed:", repr(e), "data=", data[:300])
+                            # best effort: surface as notification
+                            await self._remote_out_q.put({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/message",
+                                "params": {"level": "error", "message": f"bridge: failed to parse SSE JSON: {e!r}"},
+                            })
 
-                        await self._remote_out_q.put(msg)
-
-            except (httpx.HTTPError, asyncio.CancelledError) as e:
-                if isinstance(e, asyncio.CancelledError):
-                    return
-                _log("SSE error:", repr(e))
+            except asyncio.CancelledError:
+                return
+            except httpx.HTTPError as e:
+                _log("SSE HTTPError:", repr(e), "reconnect in", self.reconnect_s)
                 await asyncio.sleep(self.reconnect_s)
             except Exception as e:
-                _log("SSE unexpected:", repr(e))
+                _log("SSE unexpected:", repr(e), "reconnect in", max(self.reconnect_s, 2.0))
                 await asyncio.sleep(max(self.reconnect_s, 2.0))
-
-    async def _enqueue_jsonrpc_from_post_response(self, r: httpx.Response) -> None:
-        """
-        If remote returns JSON in the POST response body see if it looks like a JSON-RPC message
-        and forward it to stdio. This is critical for initialize on many servers.
-        """
-        ctype = (r.headers.get("content-type") or "").lower()
-        if "application/json" not in ctype:
-            return
-
-        try:
-            payload = r.json()
-        except Exception:
-            return
-
-        if isinstance(payload, dict):
-            if payload.get("jsonrpc") == "2.0":
-                await self._remote_out_q.put(payload)
-            return
-
-        if isinstance(payload, list):
-            for item in payload:
-                if isinstance(item, dict) and item.get("jsonrpc") == "2.0":
-                    await self._remote_out_q.put(item)
 
     async def _stdio_in_loop(self) -> None:
         stdin = sys.stdin.buffer
         while not self._stop.is_set():
             msg = stdio_read_message(stdin)
             if msg is None:
+                _log("stdin EOF -> closing")
                 await self.close()
                 return
 
-            _log("-> remote", "method=", msg.get("method"), "id=", msg.get("id"))
+            _log("STDIN ->", "id=", msg.get("id"), "method=", msg.get("method"))
 
             url = await self._ensure_messages_url()
 
@@ -341,24 +335,30 @@ class Bridge:
                 r = await self._client.post(
                     url,
                     json=msg,
-                    headers={
-                        "content-type": "application/json",
-                        "accept": "application/json, text/plain, */*",
-                    },
+                    headers={"content-type": "application/json"},
                 )
-                # Forward immediate JSON response if present.
-                await self._enqueue_jsonrpc_from_post_response(r)
+
+                # If the session died, force endpoint refresh by clearing and waiting for SSE to provide a new one.
+                if r.status_code == 400 and "Invalid session ID" in (r.text or ""):
+                    _log("POST got Invalid session ID; clearing messages_url and retrying once")
+                    self.messages_url = None
+                    url = await self._ensure_messages_url()
+                    r = await self._client.post(
+                        url,
+                        json=msg,
+                        headers={"content-type": "application/json"},
+                    )
+
+                # Many servers return 202 with no JSON body; that is OK.
+                _log("POST <-", r.status_code)
 
             except httpx.HTTPError as e:
-                err = {
+                _log("POST HTTPError:", repr(e))
+                await self._remote_out_q.put({
                     "jsonrpc": "2.0",
                     "id": msg.get("id"),
-                    "error": {
-                        "code": -32000,
-                        "message": f"Bridge failed to POST to remote MCP: {type(e).__name__}: {e}",
-                    },
-                }
-                await self._remote_out_q.put(err)
+                    "error": {"code": -32000, "message": f"Bridge failed to POST to remote MCP: {type(e).__name__}: {e}"},
+                })
                 await asyncio.sleep(0.25)
 
     async def _stdio_out_loop(self) -> None:
@@ -366,9 +366,14 @@ class Bridge:
         while not self._stop.is_set():
             msg = await self._remote_out_q.get()
             try:
-                _log("<- stdio", "method=", msg.get("method"), "id=", msg.get("id"))
+                _log("STDOUT <-", "id=", msg.get("id"), "method=", msg.get("method"))
                 stdio_write_message(stdout, msg)
-            except Exception:
+            except BrokenPipeError:
+                _log("stdout BrokenPipe -> closing")
+                await self.close()
+                return
+            except Exception as e:
+                _log("stdout write failed:", repr(e))
                 await self.close()
                 return
 
@@ -387,5 +392,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        _log("fatal:", repr(e))
+        # Ensure fatal errors appear in Claude logs (stderr)
+        try:
+            print(f"[pviz-bridge] FATAL: {e!r}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
         raise
