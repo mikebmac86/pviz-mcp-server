@@ -47,32 +47,81 @@ def _split_csv_env(name: str, default: str = "") -> List[str]:
     return [p.strip() for p in v.split(",") if p.strip()]
 
 
-def _expand_host_variants(hosts: List[str]) -> List[str]:
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _strip_scheme_and_port(host: str) -> str:
     """
-    Some host validators treat "example.com" and "example.com:443" differently.
-    Also, some support a port wildcard like "example.com:*".
-    We include a few variants defensively.
+    Defensive cleanup for host-like values that may incorrectly include
+    scheme and/or ports (e.g., 'https://example.com:443').
+    """
+    h = (host or "").strip()
+    if not h:
+        return ""
+    if h == "*":
+        return "*"
+
+    # Remove scheme if present
+    if "://" in h:
+        h = h.split("://", 1)[1]
+
+    # Remove any path/query fragments (paranoia)
+    h = h.split("/", 1)[0]
+    h = h.split("?", 1)[0]
+    h = h.split("#", 1)[0]
+
+    # Strip port if present
+    if ":" in h:
+        h = h.split(":", 1)[0]
+
+    return h.strip()
+
+
+def _starlette_safe_hosts(hosts: List[str]) -> List[str]:
+    """
+    Starlette TrustedHostMiddleware only accepts host patterns, not ports.
+    Valid shapes include:
+      - 'example.com'
+      - '*.example.com'
+      - '*'
+    """
+    cleaned: List[str] = []
+    for h in hosts:
+        h2 = _strip_scheme_and_port(h)
+        if h2:
+            cleaned.append(h2)
+    return _dedupe_preserve_order(cleaned)
+
+
+def _expand_host_variants_for_mcp(hosts: List[str]) -> List[str]:
+    """
+    MCP SDK transport security may treat "example.com" and "example.com:443"
+    differently depending on proxying and Host headers.
+
+    We include a few variants defensively for MCP transport security ONLY.
+    Do NOT use these for Starlette TrustedHostMiddleware.
     """
     out: List[str] = []
-    for h in hosts:
+    for raw in hosts:
+        h = (raw or "").strip()
         if not h:
             continue
         out.append(h)
 
-        # If host has no port, add a wildcard-port variant (if the SDK supports it)
+        # If host has no port, add a few port variants (if the SDK supports them)
         if ":" not in h and h != "*":
             out.append(f"{h}:*")
             out.append(f"{h}:443")
             out.append(f"{h}:80")
 
-    # De-dupe preserving order
-    seen = set()
-    deduped: List[str] = []
-    for h in out:
-        if h not in seen:
-            seen.add(h)
-            deduped.append(h)
-    return deduped
+    return _dedupe_preserve_order(out)
 
 
 def _configure_mcp_transport_security() -> None:
@@ -97,18 +146,17 @@ def _configure_mcp_transport_security() -> None:
         allowed_hosts = ["*"]
         allowed_origins = ["*"]
 
-    allowed_hosts = _expand_host_variants(allowed_hosts)
+    # For MCP we can optionally include port variants; keep host strings as-is.
+    allowed_hosts = _expand_host_variants_for_mcp(allowed_hosts)
 
     # The MCP SDK uses TransportSecuritySettings on the FastMCP settings.
-    # This code assumes pviz_mcp_server.mcp is a FastMCP instance (as your traceback shows).
+    # This code assumes pviz_mcp_server.mcp is a FastMCP instance.
     try:
         from mcp.server.transport_security import TransportSecuritySettings  # type: ignore
 
         ts = TransportSecuritySettings(
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
-            # If the SDK supports this flag, keep it enabled by default.
-            # You can disable temporarily with MCP_ENABLE_DNS_REBINDING_PROTECTION=0
             enable_dns_rebinding_protection=_bool_env(
                 "MCP_ENABLE_DNS_REBINDING_PROTECTION", True
             ),
@@ -179,9 +227,21 @@ routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
     Route("/", endpoint=info_endpoint, methods=["GET"]),
     Route("/mcp", endpoint=mcp_redirect, methods=["GET"]),
-    Route("/.well-known/oauth-protected-resource", endpoint=oauth_not_supported, methods=["GET"]),
-    Route("/.well-known/oauth-protected-resource/mcp", endpoint=oauth_not_supported, methods=["GET"]),
-    Route("/.well-known/oauth-authorization-server", endpoint=oauth_not_supported, methods=["GET"]),
+    Route(
+        "/.well-known/oauth-protected-resource",
+        endpoint=oauth_not_supported,
+        methods=["GET"],
+    ),
+    Route(
+        "/.well-known/oauth-protected-resource/mcp",
+        endpoint=oauth_not_supported,
+        methods=["GET"],
+    ),
+    Route(
+        "/.well-known/oauth-authorization-server",
+        endpoint=oauth_not_supported,
+        methods=["GET"],
+    ),
     Mount("/mcp", app=mcp_asgi_app),
 ]
 
@@ -197,10 +257,12 @@ starlette_allowed_hosts = _split_csv_env(
 if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
     starlette_allowed_hosts = ["*"]
 
+starlette_allowed_hosts = _starlette_safe_hosts(starlette_allowed_hosts)
+
 if starlette_allowed_hosts:
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=_expand_host_variants(starlette_allowed_hosts),
+        allowed_hosts=starlette_allowed_hosts,
     )
 
 # ---------------------------------------------------------------------------
