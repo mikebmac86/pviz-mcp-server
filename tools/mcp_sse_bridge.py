@@ -35,6 +35,10 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
+print("[pviz-bridge] BOOT (stderr visible)", file=sys.stderr, flush=True)
+print("[pviz-bridge] ENV MCP_DEBUG=", os.getenv("MCP_DEBUG"), file=sys.stderr, flush=True)
+print("[pviz-bridge] ENV MCP_REMOTE_URL=", os.getenv("MCP_REMOTE_URL"), file=sys.stderr, flush=True)
+
 
 # ---------------------------
 # Debug logging (stderr only)
@@ -107,7 +111,6 @@ def stdio_read_message(stdin_buf) -> Optional[Dict[str, Any]]:
         return msg
     except Exception as e:
         _log("stdin: json parse error:", repr(e), "raw=", body[:200])
-        # Surface parse error as notification (best effort)
         return {
             "jsonrpc": "2.0",
             "method": "notifications/message",
@@ -167,6 +170,7 @@ async def _aiter_sse_events(resp: httpx.Response):
             continue
 
         if line.startswith("data:"):
+            # tolerate "data: <json>" and "data:<json>"
             data_lines.append(line[len("data:"):].lstrip())
             continue
 
@@ -225,14 +229,22 @@ class Bridge:
         self._stop = asyncio.Event()
         self._remote_out_q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 
-        headers = {
+        http2 = _bool_env("MCP_HTTP2", False)
+
+        # SSE friendliness:
+        # - Origin is often required by transport security logic
+        # - identity prevents gzip/deflate buffering oddities for SSE
+        # - no-cache encourages intermediaries to stream immediately
+        headers: Dict[str, str] = {
             "accept": "text/event-stream",
-            "user-agent": "pviz-mcp-stdio-bridge/1.2",
+            "cache-control": "no-cache",
+            "accept-encoding": "identity",
+            "connection": "keep-alive",
+            "origin": self.origin,
+            "user-agent": "pviz-mcp-stdio-bridge/1.3",
         }
         if self.jwt:
             headers["authorization"] = f"Bearer {self.jwt}"
-
-        http2 = _bool_env("MCP_HTTP2", False)
 
         self._client = httpx.AsyncClient(
             headers=headers,
@@ -241,10 +253,14 @@ class Bridge:
             http2=http2,
         )
 
-        _log("BOOT",
-             "remote_base=", self.remote_base,
-             "sse_url=", self.sse_url,
-             "http2=", http2)
+        _log(
+            "BOOT",
+            "remote_base=", self.remote_base,
+            "sse_url=", self.sse_url,
+            "origin=", self.origin,
+            "http2=", http2,
+            "JWT present=", bool(self.jwt),
+        )
 
     async def close(self) -> None:
         self._stop.set()
@@ -278,6 +294,12 @@ class Bridge:
                 _log("SSE connect ->", self.sse_url)
                 async with self._client.stream("GET", self.sse_url) as resp:
                     resp.raise_for_status()
+                    _log(
+                        "SSE status=",
+                        resp.status_code,
+                        "content-type=",
+                        resp.headers.get("content-type"),
+                    )
 
                     async for ev in _aiter_sse_events(resp):
                         if self._stop.is_set():
@@ -302,12 +324,16 @@ class Bridge:
                             await self._remote_out_q.put(msg)
                         except Exception as e:
                             _log("SSE json parse failed:", repr(e), "data=", data[:300])
-                            # best effort: surface as notification
-                            await self._remote_out_q.put({
-                                "jsonrpc": "2.0",
-                                "method": "notifications/message",
-                                "params": {"level": "error", "message": f"bridge: failed to parse SSE JSON: {e!r}"},
-                            })
+                            await self._remote_out_q.put(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/message",
+                                    "params": {
+                                        "level": "error",
+                                        "message": f"bridge: failed to parse SSE JSON: {e!r}",
+                                    },
+                                }
+                            )
 
             except asyncio.CancelledError:
                 return
@@ -338,7 +364,6 @@ class Bridge:
                     headers={"content-type": "application/json"},
                 )
 
-                # If the session died, force endpoint refresh by clearing and waiting for SSE to provide a new one.
                 if r.status_code == 400 and "Invalid session ID" in (r.text or ""):
                     _log("POST got Invalid session ID; clearing messages_url and retrying once")
                     self.messages_url = None
@@ -349,16 +374,20 @@ class Bridge:
                         headers={"content-type": "application/json"},
                     )
 
-                # Many servers return 202 with no JSON body; that is OK.
-                _log("POST <-", r.status_code)
+                _log("POST <-", r.status_code, "len=", len(r.text or ""))
 
             except httpx.HTTPError as e:
                 _log("POST HTTPError:", repr(e))
-                await self._remote_out_q.put({
-                    "jsonrpc": "2.0",
-                    "id": msg.get("id"),
-                    "error": {"code": -32000, "message": f"Bridge failed to POST to remote MCP: {type(e).__name__}: {e}"},
-                })
+                await self._remote_out_q.put(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg.get("id"),
+                        "error": {
+                            "code": -32000,
+                            "message": f"Bridge failed to POST to remote MCP: {type(e).__name__}: {e}",
+                        },
+                    }
+                )
                 await asyncio.sleep(0.25)
 
     async def _stdio_out_loop(self) -> None:
@@ -392,7 +421,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        # Ensure fatal errors appear in Claude logs (stderr)
         try:
             print(f"[pviz-bridge] FATAL: {e!r}", file=sys.stderr, flush=True)
         except Exception:
