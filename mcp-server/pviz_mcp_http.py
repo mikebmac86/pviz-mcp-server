@@ -15,15 +15,18 @@ Deploy behind Caddy or any reverse proxy.
 from __future__ import annotations
 
 import os
+
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, RedirectResponse
-from starlette.routing import Route, Mount
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.routing import Mount, Route
+
 from pviz_mcp_server import mcp
 
 try:
     from demo_account import DemoAccountMiddleware  # type: ignore
+
     DEMO_AVAILABLE = True
 except Exception:
     DEMO_AVAILABLE = False
@@ -34,6 +37,13 @@ def _bool_env(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _split_csv_env(name: str, default: str = "") -> list[str]:
+    v = os.getenv(name, default).strip()
+    if not v:
+        return []
+    return [p.strip() for p in v.split(",") if p.strip()]
 
 
 async def health_check(request):
@@ -82,15 +92,24 @@ mcp_asgi_app = mcp.sse_app()
 routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
     Route("/", endpoint=info_endpoint, methods=["GET"]),
-
     # Make /mcp a redirect, and let the mounted transport handle /mcp/*
     Route("/mcp", endpoint=mcp_redirect, methods=["GET"]),
-
     # Optional OAuth probe endpoints
-    Route("/.well-known/oauth-protected-resource", endpoint=oauth_not_supported, methods=["GET"]),
-    Route("/.well-known/oauth-protected-resource/mcp", endpoint=oauth_not_supported, methods=["GET"]),
-    Route("/.well-known/oauth-authorization-server", endpoint=oauth_not_supported, methods=["GET"]),
-
+    Route(
+        "/.well-known/oauth-protected-resource",
+        endpoint=oauth_not_supported,
+        methods=["GET"],
+    ),
+    Route(
+        "/.well-known/oauth-protected-resource/mcp",
+        endpoint=oauth_not_supported,
+        methods=["GET"],
+    ),
+    Route(
+        "/.well-known/oauth-authorization-server",
+        endpoint=oauth_not_supported,
+        methods=["GET"],
+    ),
     # Mount MCP transport under /mcp (handles /mcp/sse and /mcp/messages)
     Mount("/mcp", app=mcp_asgi_app),
 ]
@@ -98,27 +117,30 @@ routes = [
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
 
 # ---------------------------------------------------------------------------
-# Host allowlist (fixes "Invalid Host header" from the MCP SSE transport)
+# Host allowlist (fixes 421 / "Invalid Host header" behaviors behind proxies)
 # ---------------------------------------------------------------------------
-allowed_hosts_env = os.getenv(
+allowed_hosts = _split_csv_env(
     "ALLOWED_HOSTS",
-    "mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server",
-)
-allowed_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
-
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=allowed_hosts,
+    default="mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server",
 )
 
+# Optional: allow any host (NOT recommended) for debugging only.
+# Set PVIZ_ALLOW_ANY_HOST=1 temporarily if needed.
+if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
+    allowed_hosts = ["*"]
+
+if allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+# ---------------------------------------------------------------------------
 # CORS only if explicitly configured
-cors_origins = os.getenv("CORS_ORIGINS")
+# ---------------------------------------------------------------------------
+cors_origins = _split_csv_env("CORS_ORIGINS", default="")
 if cors_origins:
-    origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
-    allow_credentials = "*" not in origins
+    allow_credentials = "*" not in cors_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
+        allow_origins=cors_origins,
         allow_credentials=allow_credentials,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
@@ -126,7 +148,6 @@ if cors_origins:
 
 if DEMO_AVAILABLE:
     app.add_middleware(DemoAccountMiddleware)
-
 
 if __name__ == "__main__":
     import uvicorn
