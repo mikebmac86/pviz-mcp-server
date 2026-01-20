@@ -86,8 +86,32 @@ async def oauth_not_supported(request):
     )
 
 
+# ---------------------------------------------------------------------------
+# Host allowlist (fixes 421 / "Invalid Host header" behind proxies)
+#
+# IMPORTANT:
+#   /mcp/* is served by the mounted MCP transport app (mcp.sse_app()).
+#   Middleware added to the outer Starlette `app` does NOT affect the mounted app.
+#   Therefore we must wrap BOTH:
+#     1) the mounted mcp_asgi_app
+#     2) the outer Starlette app (optional but fine)
+# ---------------------------------------------------------------------------
+allowed_hosts = _split_csv_env(
+    "ALLOWED_HOSTS",
+    default="mcp.pvizgenerator.com,mcp.pvizgenerator.com:443,localhost,127.0.0.1,pviz-mcp-server",
+)
+
+# Optional: allow any host (NOT recommended) for debugging only.
+# Set PVIZ_ALLOW_ANY_HOST=1 temporarily if needed.
+if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
+    allowed_hosts = ["*"]
+
 # MCP SDK SSE ASGI app (this is what mcp-remote expects to talk to at /mcp/*)
 mcp_asgi_app = mcp.sse_app()
+
+# Wrap the mounted MCP transport app (critical fix for /mcp/sse 421)
+if allowed_hosts:
+    mcp_asgi_app = TrustedHostMiddleware(mcp_asgi_app, allowed_hosts=allowed_hosts)
 
 routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
@@ -116,19 +140,7 @@ routes = [
 
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
 
-# ---------------------------------------------------------------------------
-# Host allowlist (fixes 421 / "Invalid Host header" behaviors behind proxies)
-# ---------------------------------------------------------------------------
-allowed_hosts = _split_csv_env(
-    "ALLOWED_HOSTS",
-    default="mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server",
-)
-
-# Optional: allow any host (NOT recommended) for debugging only.
-# Set PVIZ_ALLOW_ANY_HOST=1 temporarily if needed.
-if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
-    allowed_hosts = ["*"]
-
+# Optionally also protect the outer app endpoints (/ and /health, etc.)
 if allowed_hosts:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
