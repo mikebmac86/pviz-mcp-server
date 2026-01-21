@@ -2,15 +2,12 @@ services:
   pviz-mcp-server:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: mcp_server/Dockerfile
     restart: unless-stopped
     environment:
       PVIZ_API_URL: http://api:8000
-      PVIZ_JWT_TOKEN_FILE: /run/secrets/mcp_jwt_token
       PORT: 8080
       HOST: 0.0.0.0
       LOG_LEVEL: info
-    secrets:
-      - mcp_jwt_token
     ports:
       - "8080:8080"
