@@ -235,12 +235,8 @@ class MCPAuthBindMiddleware:
         try:
             await self.app(scope, receive, send)
         finally:
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                PVIZ_REQUEST_BEARER.reset(token_ctx)
-                PVIZ_SESSION_ID.reset(session_ctx)  # Add this line
-
+            PVIZ_REQUEST_BEARER.reset(token_ctx)
+            PVIZ_SESSION_ID.reset(session_ctx)
 
 # -----------------------------------------------------------------------------
 # ASGI middleware (SSE-safe): Debug /mcp/messages body without breaking streaming
