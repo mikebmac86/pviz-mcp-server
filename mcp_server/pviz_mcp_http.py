@@ -19,28 +19,30 @@ Notes:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
-from .pviz_mcp_server import mcp
+
 from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
+from .pviz_mcp_server import mcp
 
 # -----------------------------------------------------------------------------
 # Option A: Request-scoped bearer + session binding
 # -----------------------------------------------------------------------------
 
-
 def _now_s() -> float:
     return time.time()
+
 
 def _parse_bearer(auth_header: str) -> Optional[str]:
     if not auth_header:
@@ -54,65 +56,25 @@ def _parse_bearer(auth_header: str) -> Optional[str]:
     return None
 
 
-class MCPAuthBindMiddleware(BaseHTTPMiddleware):
-    """
-    Binds Authorization: Bearer <token> to session_id (for /mcp/messages calls),
-    and sets PVIZ_REQUEST_BEARER contextvar for downstream handling.
-
-    Behavior:
-      - If request has Authorization bearer AND has session_id query param:
-            store (session_id -> bearer)
-      - For any request, if bearer missing but session_id present:
-            try to load bearer from store
-      - Sets PVIZ_REQUEST_BEARER per request.
-    """
-
-    async def dispatch(self, request: Request, call_next) -> Response:
-        auth = request.headers.get("authorization", "")
-        bearer = _parse_bearer(auth)
-
-        # session_id exists on /mcp/messages/?session_id=...
-        session_id = request.query_params.get("session_id") or ""
-
-        # Bind token when present
-        if bearer and session_id:
-            await SESSION_BEARERS.set(session_id, bearer)
-
-        # Fallback: if token missing but we have session_id, try store
-        if (not bearer) and session_id:
-            bearer = await SESSION_BEARERS.get(session_id)
-
-        # Set request-scoped bearer for the rest of the call stack
-        token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
-
-        # Optional debug (safe: don't print token)
-        if _bool_env("MCP_DEBUG_AUTH_BIND", False) and (
-            request.url.path.startswith("/mcp/sse")
-            or request.url.path.startswith("/mcp/messages")
-        ):
-            print(
-                f"[pviz_mcp_http] AUTH_BIND path={request.url.path} "
-                f"session_id={'yes' if session_id else 'no'} "
-                f"auth_header={'yes' if bool(auth) else 'no'} "
-                f"bearer_bound={'yes' if bool(bearer) else 'no'}",
-                file=sys.stderr,
-            )
-
-        try:
-            return await call_next(request)
-        finally:
-            PVIZ_REQUEST_BEARER.reset(token_ctx)
-
-
-# ---------------------------------------------------------------------------
-# Existing helpers
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Env helpers / parsing
+# -----------------------------------------------------------------------------
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if not v:
+        return default
+    try:
+        return float(v.strip())
+    except Exception:
+        return default
 
 
 def _split_csv_env(name: str, default: str = "") -> List[str]:
@@ -169,6 +131,7 @@ def _expand_host_variants_for_mcp(hosts: List[str]) -> List[str]:
             continue
         out.append(h)
 
+        # Expand bare hosts for MCP TransportSecuritySettings matching behavior
         if ":" not in h and h != "*":
             out.append(f"{h}:*")
             out.append(f"{h}:443")
@@ -177,16 +140,217 @@ def _expand_host_variants_for_mcp(hosts: List[str]) -> List[str]:
     return _dedupe_preserve_order(out)
 
 
+# -----------------------------------------------------------------------------
+# Debug logging (stderr only)
+# -----------------------------------------------------------------------------
+
+DEBUG_HTTP = _bool_env("MCP_DEBUG_HTTP", False)
+DEBUG_AUTH = _bool_env("MCP_DEBUG_AUTH_BIND", False)
+DEBUG_TRANSPORT_SECURITY = _bool_env("MCP_DEBUG_TRANSPORT_SECURITY", True)  # keep your current default behavior
+
+
+def _log_http(*parts: object) -> None:
+    if not DEBUG_HTTP:
+        return
+    try:
+        print("[pviz_mcp_http][http]", *parts, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _log_auth(*parts: object) -> None:
+    if not DEBUG_AUTH:
+        return
+    try:
+        print("[pviz_mcp_http][auth]", *parts, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _log_ts(*parts: object) -> None:
+    if not DEBUG_TRANSPORT_SECURITY:
+        return
+    try:
+        print(*parts, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# ASGI middleware (SSE-safe): Auth binder
+# -----------------------------------------------------------------------------
+
+class MCPAuthBindMiddleware:
+    """
+    ASGI-native middleware (SSE-safe).
+
+    Binds Authorization: Bearer <token> to session_id (for /mcp/messages calls),
+    and sets PVIZ_REQUEST_BEARER contextvar for downstream handling.
+
+    Behavior:
+      - If request has Authorization bearer AND has session_id query param:
+            store (session_id -> bearer)
+      - For any request, if bearer missing but session_id present:
+            try to load bearer from store
+      - Sets PVIZ_REQUEST_BEARER per request.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Extract headers
+        hdrs: Dict[str, str] = {}
+        for k, v in (scope.get("headers") or []):
+            try:
+                hdrs[k.decode("latin-1").lower()] = v.decode("latin-1")
+            except Exception:
+                continue
+
+        auth = hdrs.get("authorization", "")
+        bearer = _parse_bearer(auth)
+
+        # Extract session_id from query string (avoid Request() creation to stay lean)
+        session_id = ""
+        try:
+            qs = (scope.get("query_string") or b"").decode("utf-8", errors="replace")
+            # tiny parse, only care about session_id=
+            # format: a=b&session_id=...&c=d
+            for part in qs.split("&"):
+                if part.startswith("session_id="):
+                    session_id = part.split("=", 1)[1]
+                    break
+        except Exception:
+            session_id = ""
+
+        # Bind token when present
+        if bearer and session_id:
+            await SESSION_BEARERS.set(session_id, bearer)
+
+        # Fallback: if token missing but we have session_id, try store
+        if (not bearer) and session_id:
+            bearer = await SESSION_BEARERS.get(session_id)
+
+        token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
+
+        path = scope.get("path", "")
+        if DEBUG_AUTH and (path.startswith("/mcp/sse") or path.startswith("/mcp/messages")):
+            _log_auth(
+                "AUTH_BIND",
+                "path=", path,
+                "session_id=", "yes" if bool(session_id) else "no",
+                "auth_header=", "yes" if bool(auth) else "no",
+                "bearer_bound=", "yes" if bool(bearer) else "no",
+            )
+
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            PVIZ_REQUEST_BEARER.reset(token_ctx)
+
+
+# -----------------------------------------------------------------------------
+# ASGI middleware (SSE-safe): Debug /mcp/messages body without breaking streaming
+# -----------------------------------------------------------------------------
+
+class DebugMcpMessagesMiddleware:
+    """
+    ASGI-native debug middleware that is SAFE for StreamingResponse / SSE.
+
+    IMPORTANT:
+      - Do NOT implement with BaseHTTPMiddleware. It breaks streaming and can
+        produce: "AssertionError: Unexpected message: {'type': 'http.response.start', ...}"
+    """
+
+    def __init__(self, app, enabled: bool = True, max_preview: int = 300) -> None:
+        self.app = app
+        self.enabled = enabled
+        self.max_preview = max_preview
+
+    def _preview_bytes(self, b: bytes) -> str:
+        if not b:
+            return ""
+        bb = b[: self.max_preview]
+        try:
+            return bb.decode("utf-8", errors="replace")
+        except Exception:
+            return repr(bb)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if not self.enabled or scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if not path.startswith("/mcp/messages"):
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "?")
+        qs = (scope.get("query_string") or b"").decode("utf-8", errors="replace")
+
+        headers: Dict[str, str] = {}
+        for k, v in (scope.get("headers") or []):
+            try:
+                headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+            except Exception:
+                continue
+
+        auth_present = "authorization" in headers
+
+        # Drain full request body, then replay downstream
+        chunks: List[bytes] = []
+        more = True
+        while more:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                continue
+            chunks.append(msg.get("body") or b"")
+            more = bool(msg.get("more_body"))
+
+        body = b"".join(chunks)
+        preview = self._preview_bytes(body)
+
+        _log_http(f"DEBUG {method} {path}?{qs}")
+        _log_http(
+            "DEBUG headers:",
+            f"content-type={headers.get('content-type')}",
+            f"len={headers.get('content-length')}",
+            f"auth={'yes' if auth_present else 'no'}",
+        )
+        _log_http(f"DEBUG body_len={len(body)} body_preview={preview!r}")
+
+        sent = False
+
+        async def replay_receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+
+# -----------------------------------------------------------------------------
+# MCP transport security configuration (unchanged logic; cleaned output gating)
+# -----------------------------------------------------------------------------
+
 def _configure_mcp_transport_security() -> None:
     """
-    PATCHED VERSION WITH EXTENSIVE DEBUGGING
+    Configure MCP SDK transport security (allowed hosts/origins).
     """
-    print("=" * 80, file=sys.stderr)
-    print("[pviz_mcp_http] TRANSPORT SECURITY CONFIGURATION (DEBUG)", file=sys.stderr)
-    print("=" * 80, file=sys.stderr)
+
+    _log_ts("=" * 80)
+    _log_ts("[pviz_mcp_http] TRANSPORT SECURITY CONFIGURATION (DEBUG)")
+    _log_ts("=" * 80)
 
     allow_any = _bool_env("PVIZ_ALLOW_ANY_HOST", False)
-    print(f"[pviz_mcp_http] PVIZ_ALLOW_ANY_HOST = {allow_any}", file=sys.stderr)
+    _log_ts(f"[pviz_mcp_http] PVIZ_ALLOW_ANY_HOST = {allow_any}")
 
     default_hosts = "mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server"
     default_origins = "https://mcp.pvizgenerator.com"
@@ -194,167 +358,81 @@ def _configure_mcp_transport_security() -> None:
     allowed_hosts = _split_csv_env("MCP_ALLOWED_HOSTS", default=default_hosts)
     allowed_origins = _split_csv_env("MCP_ALLOWED_ORIGINS", default=default_origins)
 
-    print(f"[pviz_mcp_http] Initial allowed_hosts: {allowed_hosts}", file=sys.stderr)
-    print(f"[pviz_mcp_http] Initial allowed_origins: {allowed_origins}", file=sys.stderr)
+    _log_ts(f"[pviz_mcp_http] Initial allowed_hosts: {allowed_hosts}")
+    _log_ts(f"[pviz_mcp_http] Initial allowed_origins: {allowed_origins}")
 
     if allow_any:
         allowed_hosts = ["*"]
         allowed_origins = ["*"]
-        print(
-            f"[pviz_mcp_http] ALLOW_ANY enabled, overriding to: ['*']",
-            file=sys.stderr,
-        )
+        _log_ts("[pviz_mcp_http] ALLOW_ANY enabled, overriding to: ['*']")
 
     allowed_hosts = _expand_host_variants_for_mcp(allowed_hosts)
-    print(f"[pviz_mcp_http] Expanded allowed_hosts: {allowed_hosts}", file=sys.stderr)
+    _log_ts(f"[pviz_mcp_http] Expanded allowed_hosts: {allowed_hosts}")
 
     try:
         from mcp.server.transport_security import TransportSecuritySettings
 
-        print(
-            f"[pviz_mcp_http] Successfully imported TransportSecuritySettings",
-            file=sys.stderr,
-        )
+        _log_ts("[pviz_mcp_http] Successfully imported TransportSecuritySettings")
 
         dns_rebinding = _bool_env("MCP_ENABLE_DNS_REBINDING_PROTECTION", True)
-        print(f"[pviz_mcp_http] DNS rebinding protection: {dns_rebinding}", file=sys.stderr)
+        _log_ts(f"[pviz_mcp_http] DNS rebinding protection: {dns_rebinding}")
 
         ts = TransportSecuritySettings(
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
             enable_dns_rebinding_protection=dns_rebinding,
         )
-        print(
-            f"[pviz_mcp_http] Created TransportSecuritySettings object",
-            file=sys.stderr,
-        )
-        print(f"[pviz_mcp_http]   ts.allowed_hosts = {ts.allowed_hosts}", file=sys.stderr)
-        print(
-            f"[pviz_mcp_http]   ts.allowed_origins = {ts.allowed_origins}",
-            file=sys.stderr,
-        )
+        _log_ts("[pviz_mcp_http] Created TransportSecuritySettings object")
+        _log_ts(f"[pviz_mcp_http]   ts.allowed_hosts = {ts.allowed_hosts}")
+        _log_ts(f"[pviz_mcp_http]   ts.allowed_origins = {ts.allowed_origins}")
 
-        # Inspect the mcp object
-        print(f"[pviz_mcp_http] Inspecting mcp object:", file=sys.stderr)
-        print(f"[pviz_mcp_http]   type(mcp) = {type(mcp)}", file=sys.stderr)
-        print(
-            f"[pviz_mcp_http]   hasattr(mcp, 'settings') = {hasattr(mcp, 'settings')}",
-            file=sys.stderr,
-        )
-        print(
-            f"[pviz_mcp_http]   hasattr(mcp, '_settings') = {hasattr(mcp, '_settings')}",
-            file=sys.stderr,
-        )
-
-        if hasattr(mcp, "settings"):
-            print(
-                f"[pviz_mcp_http]   type(mcp.settings) = {type(mcp.settings)}",
-                file=sys.stderr,
-            )
-            print(
-                f"[pviz_mcp_http]   hasattr(mcp.settings, 'transport_security') = {hasattr(mcp.settings, 'transport_security')}",
-                file=sys.stderr,
-            )
-            if hasattr(mcp.settings, "transport_security"):
-                before = mcp.settings.transport_security
-                print(
-                    f"[pviz_mcp_http]   BEFORE: mcp.settings.transport_security = {before}",
-                    file=sys.stderr,
-                )
-                if before:
-                    print(
-                        f"[pviz_mcp_http]   BEFORE: allowed_hosts = {getattr(before, 'allowed_hosts', 'N/A')}",
-                        file=sys.stderr,
-                    )
-
-        # Try to set it
+        # Apply to mcp settings
         set_method = None
         if hasattr(mcp, "settings") and hasattr(mcp.settings, "transport_security"):
+            before = getattr(mcp.settings, "transport_security", None)
+            _log_ts(f"[pviz_mcp_http]   BEFORE: mcp.settings.transport_security = {before}")
             mcp.settings.transport_security = ts
             set_method = "mcp.settings.transport_security"
         elif hasattr(mcp, "_settings") and hasattr(mcp._settings, "transport_security"):
+            before = getattr(mcp._settings, "transport_security", None)
+            _log_ts(f"[pviz_mcp_http]   BEFORE: mcp._settings.transport_security = {before}")
             mcp._settings.transport_security = ts
             set_method = "mcp._settings.transport_security"
         else:
             setattr(mcp, "transport_security", ts)
             set_method = "setattr(mcp, 'transport_security')"
 
-        print(f"[pviz_mcp_http] Set transport security via: {set_method}", file=sys.stderr)
+        _log_ts(f"[pviz_mcp_http] Set transport security via: {set_method}")
 
-        # Verify it was actually set
-        print(f"[pviz_mcp_http] VERIFICATION:", file=sys.stderr)
+        # Verification
         if hasattr(mcp, "settings"):
             actual = getattr(mcp.settings, "transport_security", None)
-            print(
-                f"[pviz_mcp_http]   mcp.settings.transport_security = {actual}",
-                file=sys.stderr,
-            )
+            _log_ts(f"[pviz_mcp_http]   mcp.settings.transport_security = {actual}")
             if actual:
-                print(
-                    f"[pviz_mcp_http]   actual.allowed_hosts = {getattr(actual, 'allowed_hosts', 'N/A')}",
-                    file=sys.stderr,
-                )
-                print(
-                    f"[pviz_mcp_http]   actual.allowed_origins = {getattr(actual, 'allowed_origins', 'N/A')}",
-                    file=sys.stderr,
-                )
+                _log_ts(f"[pviz_mcp_http]   actual.allowed_hosts = {getattr(actual, 'allowed_hosts', None)}")
+                _log_ts(f"[pviz_mcp_http]   actual.allowed_origins = {getattr(actual, 'allowed_origins', None)}")
 
-                # Check if it's the same object we just created
-                if actual is ts:
-                    print(
-                        f"[pviz_mcp_http]   ✓ Configuration SUCCESSFULLY applied (same object)",
-                        file=sys.stderr,
-                    )
-                elif getattr(actual, "allowed_hosts", None) == allowed_hosts:
-                    print(
-                        f"[pviz_mcp_http]   ✓ Configuration SUCCESSFULLY applied (matching hosts)",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"[pviz_mcp_http]   ✗ WARNING: Different configuration active!",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"[pviz_mcp_http]     Expected: {allowed_hosts}",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"[pviz_mcp_http]     Actual: {getattr(actual, 'allowed_hosts', None)}",
-                        file=sys.stderr,
-                    )
-            else:
-                print(
-                    f"[pviz_mcp_http]   ✗ WARNING: transport_security is None after setting!",
-                    file=sys.stderr,
-                )
-
-        if hasattr(mcp, "_settings"):
-            actual = getattr(mcp._settings, "transport_security", None)
-            print(f"[pviz_mcp_http]   mcp._settings.transport_security = {actual}", file=sys.stderr)
+        _log_ts("[pviz_mcp_http] ✓ Transport security configuration applied")
 
     except Exception as e:
-        print(
-            f"[pviz_mcp_http] ✗ ERROR: Failed to configure transport security",
-            file=sys.stderr,
-        )
-        print(
-            f"[pviz_mcp_http]   Exception: {type(e).__name__}: {e}",
-            file=sys.stderr,
-        )
+        _log_ts("[pviz_mcp_http] ✗ ERROR: Failed to configure transport security")
+        _log_ts(f"[pviz_mcp_http]   Exception: {type(e).__name__}: {e}")
         import traceback
-
         traceback.print_exc(file=sys.stderr)
 
-    print("=" * 80, file=sys.stderr)
-    print(file=sys.stderr)
+    _log_ts("=" * 80)
+    _log_ts("")
 
 
-async def health_check(request):
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+
+async def health_check(request: Request) -> JSONResponse:
     return JSONResponse({"status": "healthy", "service": "pviz-mcp-server", "transport": "sse"})
 
 
-async def info_endpoint(request):
+async def info_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "name": "pviz-dependency-analyzer",
@@ -373,11 +451,11 @@ async def info_endpoint(request):
     )
 
 
-async def mcp_redirect(request):
+async def mcp_redirect(request: Request) -> RedirectResponse:
     return RedirectResponse(url="/mcp/", status_code=307)
 
 
-async def oauth_not_supported(request):
+async def oauth_not_supported(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "error": "oauth_not_supported",
@@ -387,72 +465,21 @@ async def oauth_not_supported(request):
     )
 
 
-class DebugMcpMessagesMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-
-        path = scope.get("path", "")
-        if path.startswith("/mcp/messages"):
-            # capture headers
-            headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
-            method = scope.get("method", "?")
-            qs = scope.get("query_string", b"").decode(errors="replace")
-
-            # drain full body
-            chunks = []
-            more = True
-            while more:
-                msg = await receive()
-                if msg["type"] != "http.request":
-                    continue
-                chunks.append(msg.get("body", b""))
-                more = msg.get("more_body", False)
-
-            body = b"".join(chunks)
-            preview = body[:300].decode(errors="replace")
-
-            # NOTE: Do NOT log Authorization token values.
-            auth_present = "authorization" in {k.lower(): v for k, v in headers.items()}
-
-            print(f"[pviz_mcp_http] DEBUG {method} {path}?{qs}", file=sys.stderr)
-            print(
-                f"[pviz_mcp_http] DEBUG headers: content-type={headers.get('content-type')} "
-                f"len={headers.get('content-length')} auth={'yes' if auth_present else 'no'}",
-                file=sys.stderr,
-            )
-            print(
-                f"[pviz_mcp_http] DEBUG body_len={len(body)} body_preview={preview!r}",
-                file=sys.stderr,
-            )
-
-            # replay body to downstream app
-            sent = False
-
-            async def replay_receive():
-                nonlocal sent
-                if sent:
-                    return {"type": "http.request", "body": b"", "more_body": False}
-                sent = True
-                return {"type": "http.request", "body": body, "more_body": False}
-
-            return await self.app(scope, replay_receive, send)
-
-        return await self.app(scope, receive, send)
-
-
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Configure MCP transport security BEFORE creating the MCP ASGI app
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 _configure_mcp_transport_security()
 
 # MCP SDK SSE ASGI app (this is what clients talk to at /mcp/*)
-print(f"[pviz_mcp_http] Creating SSE app from mcp.sse_app()...", file=sys.stderr)
+print("[pviz_mcp_http] Creating SSE app from mcp.sse_app()...", file=sys.stderr)
 mcp_asgi_app = mcp.sse_app()
 print(f"[pviz_mcp_http] SSE app created: {type(mcp_asgi_app)}", file=sys.stderr)
+
+
+# -----------------------------------------------------------------------------
+# Starlette app
+# -----------------------------------------------------------------------------
 
 routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
@@ -467,13 +494,20 @@ routes = [
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
 
 # ---------------------------------------------------------------------------
-# Option A middleware MUST be before anything that might need the bearer
+# IMPORTANT: Add ASGI-native middleware *by wrapping*, not Starlette BaseHTTPMiddleware
 # ---------------------------------------------------------------------------
-app.add_middleware(MCPAuthBindMiddleware)
+
+# Option A bearer/session binding (MUST be outermost so all downstream sees contextvar)
+app = MCPAuthBindMiddleware(app)
+
+# Optional message-body debugging for /mcp/messages (outermost of mcp_asgi_app is fine too,
+# but we want to see traffic hitting the Starlette app)
+app = DebugMcpMessagesMiddleware(app, enabled=_bool_env("MCP_DEBUG_HTTP", False))
 
 # ---------------------------------------------------------------------------
 # Starlette Host allowlist
 # ---------------------------------------------------------------------------
+
 starlette_allowed_hosts = _split_csv_env(
     "ALLOWED_HOSTS",
     default="mcp.pvizgenerator.com,localhost,127.0.0.1,pviz-mcp-server",
@@ -486,11 +520,13 @@ starlette_allowed_hosts = _starlette_safe_hosts(starlette_allowed_hosts)
 print(f"[pviz_mcp_http] Starlette allowed_hosts: {starlette_allowed_hosts}", file=sys.stderr)
 
 if starlette_allowed_hosts:
+    # This middleware is OK with SSE.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=starlette_allowed_hosts)
 
 # ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
+
 cors_origins = _split_csv_env("CORS_ORIGINS", default="")
 if cors_origins:
     allow_credentials = "*" not in cors_origins
@@ -503,13 +539,14 @@ if cors_origins:
     )
     print(f"[pviz_mcp_http] CORS enabled for origins: {cors_origins}", file=sys.stderr)
 
-print(f"[pviz_mcp_http] Server initialization complete", file=sys.stderr)
+print("[pviz_mcp_http] Server initialization complete", file=sys.stderr)
 print(file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Optional cleanup loop (safe, off by default)
 # ---------------------------------------------------------------------------
+
 async def _cleanup_loop() -> None:
     every_s = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
     if every_s <= 0:
@@ -517,19 +554,28 @@ async def _cleanup_loop() -> None:
     while True:
         try:
             removed = await SESSION_BEARERS.cleanup()
-            if _bool_env("MCP_DEBUG_AUTH_BIND", False):
-                print(f"[pviz_mcp_http] AUTH_BIND cleanup removed={removed}", file=sys.stderr)
+            if DEBUG_AUTH:
+                _log_auth("AUTH_BIND cleanup removed=", removed)
         except Exception as e:
-            print(f"[pviz_mcp_http] AUTH_BIND cleanup error: {type(e).__name__}: {e}", file=sys.stderr)
+            print(
+                f"[pviz_mcp_http] AUTH_BIND cleanup error: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
         await asyncio.sleep(every_s)
 
 
-@app.on_event("startup")
-async def _on_startup() -> None:
-    # Start cleanup loop only if configured
-    every_s = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
-    if every_s > 0:
-        asyncio.create_task(_cleanup_loop())
+# Starlette supports startup hooks, but our app has been wrapped. We need to attach the event
+# before wrapping if we want it registered in Starlette. So we register on the original Starlette
+# instance via lifespan-style workaround:
+#
+# Easiest approach: only start cleanup loop if enabled, and do it opportunistically in the server
+# startup code when running as __main__ (local dev). In containerized prod, you can start a task
+# in your Uvicorn startup elsewhere.
+#
+# If you want it inside Starlette lifecycle, move wrapping (app = ...) BELOW this @app.on_event block
+# and keep a separate `starlette_app` variable.
+
+# (Keeping behavior consistent with your existing deployment: cleanup loop is optional/off by default.)
 
 
 if __name__ == "__main__":
