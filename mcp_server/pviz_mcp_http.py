@@ -483,7 +483,7 @@ print(f"[pviz_mcp_http] SSE app created: {type(mcp_asgi_app)}", file=sys.stderr)
 
 mcp_wrapped = mcp_asgi_app
 mcp_wrapped = MCPAuthBindMiddleware(mcp_wrapped)
-mcp_wrapped = DebugMcpMessagesMiddleware(mcp_wrapped, enabled=_bool_env("MCP_DEBUG_HTTP", False))
+#mcp_wrapped = DebugMcpMessagesMiddleware(mcp_wrapped, enabled=_bool_env("MCP_DEBUG_HTTP", False))
 
 # -----------------------------------------------------------------------------
 # Starlette app (top-level) – remains a real Starlette instance
