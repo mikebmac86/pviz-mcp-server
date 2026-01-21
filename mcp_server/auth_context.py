@@ -7,18 +7,21 @@ from typing import Optional
 # Request-scoped bearer (set by pviz_mcp_http middleware)
 PVIZ_REQUEST_BEARER: ContextVar[Optional[str]] = ContextVar("PVIZ_REQUEST_BEARER", default=None)
 
-# Simple in-memory session store
+# Request-scoped session_id (set by pviz_mcp_http middleware)  
+PVIZ_SESSION_ID: ContextVar[Optional[str]] = ContextVar("PVIZ_SESSION_ID", default=None)
+
+# Simple in-memory session store (synchronous for easier access)
 class SessionStore:
     def __init__(self):
         self._store = {}
     
-    async def get(self, session_id: str) -> Optional[str]:
+    def get(self, session_id: str) -> Optional[str]:
         return self._store.get(session_id)
     
-    async def set(self, session_id: str, bearer: str) -> None:
+    def set(self, session_id: str, bearer: str) -> None:
         self._store[session_id] = bearer
     
-    async def cleanup(self) -> int:
+    def cleanup(self) -> int:
         # Remove old sessions (implement expiry logic if needed)
         return 0
 

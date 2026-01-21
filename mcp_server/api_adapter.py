@@ -27,7 +27,6 @@ def load_jwt_token_with_source() -> Tuple[str, str]:
     """
     Load JWT token from:
       1) PVIZ_JWT_TOKEN (direct env)
-      2) PVIZ_JWT_TOKEN_FILE (docker secret file path)
 
     Returns: (token, source) where source is 'env' or 'file'
     Raises: ValueError if not configured.
@@ -36,14 +35,7 @@ def load_jwt_token_with_source() -> Tuple[str, str]:
     if tok and tok.strip():
         return tok.strip(), "env"
 
-    tok_file = os.getenv("PVIZ_JWT_TOKEN_FILE")
-    if tok_file and tok_file.strip():
-        raw = _read_text_file(tok_file.strip())
-        tok2 = (raw or "").strip()
-        if tok2:
-            return tok2, "file"
-
-    raise ValueError("JWT not configured: set PVIZ_JWT_TOKEN or PVIZ_JWT_TOKEN_FILE")
+    raise ValueError("JWT not configured: set PVIZ_JWT_TOKEN")
 
 
 def token_fingerprint(tok: str) -> str:
@@ -117,9 +109,18 @@ class PvizAPIAdapter:
         if not _HAS_REQUEST_BEARER:
             return None
         try:
-            v = PVIZ_REQUEST_BEARER.get()  # type: ignore[attr-defined]
+            # Try context var first
+            v = PVIZ_REQUEST_BEARER.get()
             if v and isinstance(v, str) and v.strip():
                 return v.strip()
+            
+            # Fallback: try session store (for async task context loss)
+            from .auth_context import PVIZ_SESSION_ID, SESSION_BEARERS
+            session_id = PVIZ_SESSION_ID.get()
+            if session_id:
+                tok = SESSION_BEARERS.get(session_id)
+                if tok and isinstance(tok, str) and tok.strip():
+                    return tok.strip()
         except Exception:
             pass
         return None

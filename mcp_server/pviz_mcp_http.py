@@ -31,7 +31,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 
-from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
+from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS, PVIZ_SESSION_ID
 from .pviz_mcp_server import mcp
 
 
@@ -213,13 +213,14 @@ class MCPAuthBindMiddleware:
 
         # Bind token when present
         if bearer and session_id:
-            await SESSION_BEARERS.set(session_id, bearer)
+            SESSION_BEARERS.set(session_id, bearer)  # Remove await
 
         # Fallback: if token missing but we have session_id, try store
         if (not bearer) and session_id:
-            bearer = await SESSION_BEARERS.get(session_id)
+            bearer = SESSION_BEARERS.get(session_id)  # Remove await
 
         token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
+        session_ctx = PVIZ_SESSION_ID.set(session_id if session_id else None)
 
         path = scope.get("path", "")
         if DEBUG_AUTH and (path.endswith("/sse") or path.endswith("/messages") or "/messages" in path):
@@ -234,7 +235,11 @@ class MCPAuthBindMiddleware:
         try:
             await self.app(scope, receive, send)
         finally:
-            PVIZ_REQUEST_BEARER.reset(token_ctx)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                PVIZ_REQUEST_BEARER.reset(token_ctx)
+                PVIZ_SESSION_ID.reset(session_ctx)  # Add this line
 
 
 # -----------------------------------------------------------------------------
@@ -512,7 +517,7 @@ async def _cleanup_loop() -> None:
         return
     while True:
         try:
-            removed = await SESSION_BEARERS.cleanup()
+            removed = SESSION_BEARERS.cleanup()
             if DEBUG_AUTH:
                 _log_auth("AUTH_BIND cleanup removed=", removed)
         except Exception as e:

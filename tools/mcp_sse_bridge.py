@@ -466,7 +466,6 @@ class Bridge:
             "POST",
             url,
             json=msg,
-            headers={"content-type": "application/json"},
         )
         resp = await self._post_client.send(req, stream=True)
         code = resp.status_code
