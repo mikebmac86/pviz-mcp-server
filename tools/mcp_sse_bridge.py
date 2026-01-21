@@ -32,6 +32,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -151,6 +152,14 @@ async def _aiter_sse_events(resp: httpx.Response):
     async for raw_line in resp.aiter_lines():
         if raw_line is None:
             continue
+
+        if DEBUG:
+            # Raw SSE line visibility is critical for diagnosing buffering/parsing issues.
+            try:
+                print("[pviz-bridge] SSE line:", repr(raw_line), file=sys.stderr, flush=True)
+            except Exception:
+                pass
+
         line = raw_line.rstrip("\r")
 
         # Comment/ping line starts with ":" (keepalives)
@@ -214,6 +223,34 @@ def _build_urls(remote_base: str) -> Tuple[str, str]:
     return sse_url, origin
 
 
+def _join_messages_url(remote_base: str, endpoint_data: str) -> str:
+    """
+    Robustly convert the SSE 'endpoint' event data into an absolute URL.
+
+    endpoint_data examples seen in the wild:
+      - "/mcp/messages/?session_id=..."
+      - "mcp/messages/?session_id=..."
+      - "messages/?session_id=..."
+      - "https://mcp.pvizgenerator.com/mcp/messages/?session_id=..."
+    """
+    raw = (endpoint_data or "").strip()
+
+    # full URL already
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+
+    # Build origin from the remote_base (scheme://host[:port])
+    u = urlparse(remote_base.rstrip("/") + "/")
+    origin = f"{u.scheme}://{u.netloc}"
+
+    # Ensure leading slash so urljoin behaves predictably
+    if raw and not raw.startswith("/"):
+        raw = "/" + raw
+
+    # Join against origin only (not remote_base path) since server typically returns absolute paths.
+    return urljoin(origin + "/", raw)
+
+
 class Bridge:
     def __init__(self) -> None:
         self.remote_base = _env_str("MCP_REMOTE_URL", "https://mcp.pvizgenerator.com/mcp")
@@ -238,20 +275,24 @@ class Bridge:
         headers: Dict[str, str] = {
             "accept": "text/event-stream",
             "cache-control": "no-cache",
+            "pragma": "no-cache",
             "accept-encoding": "identity",
             "connection": "keep-alive",
             "origin": self.origin,
-            "user-agent": "pviz-mcp-stdio-bridge/1.3",
+            "user-agent": "pviz-mcp-stdio-bridge/1.4",
         }
         if self.jwt:
             headers["authorization"] = f"Bearer {self.jwt}"
 
+        # Prefer explicit timeout object. Keep a single timeout for simplicity.
+        timeout = httpx.Timeout(self.timeout_s)
+
         self._client = httpx.AsyncClient(
             headers=headers,
-            timeout=httpx.Timeout(self.timeout_s),
+            timeout=timeout,
             follow_redirects=True,
             http2=http2,
-            trust_env=False,   # <--- IMPORTANT
+            trust_env=False,   # IMPORTANT: ignore system proxy env vars unless you explicitly want them
         )
 
         _log(
@@ -261,6 +302,7 @@ class Bridge:
             "origin=", self.origin,
             "http2=", http2,
             "JWT present=", bool(self.jwt),
+            "timeout_s=", self.timeout_s,
         )
 
     async def close(self) -> None:
@@ -307,12 +349,13 @@ class Bridge:
                             return
 
                         if ev.event == "endpoint":
-                            path = ev.data.strip()
-                            if path.startswith("http://") or path.startswith("https://"):
-                                self.messages_url = path
-                            else:
-                                self.messages_url = f"{self.origin}{path}"
-                            _log("SSE endpoint =", self.messages_url)
+                            raw = ev.data.strip()
+                            try:
+                                self.messages_url = _join_messages_url(self.remote_base, raw)
+                                _log("SSE endpoint raw =", raw)
+                                _log("SSE endpoint url =", self.messages_url)
+                            except Exception as e:
+                                _log("SSE endpoint parse failed:", repr(e), "raw=", raw)
                             continue
 
                         data = ev.data.strip()
@@ -362,9 +405,13 @@ class Bridge:
                 r = await self._client.post(
                     url,
                     json=msg,
-                    headers={"content-type": "application/json"},
+                    headers={
+                        "content-type": "application/json",
+                        "accept": "application/json",
+                    },
                 )
 
+                # A common failure mode if the SSE session rotated.
                 if r.status_code == 400 and "Invalid session ID" in (r.text or ""):
                     _log("POST got Invalid session ID; clearing messages_url and retrying once")
                     self.messages_url = None
@@ -372,7 +419,10 @@ class Bridge:
                     r = await self._client.post(
                         url,
                         json=msg,
-                        headers={"content-type": "application/json"},
+                        headers={
+                            "content-type": "application/json",
+                            "accept": "application/json",
+                        },
                     )
 
                 _log("POST <-", r.status_code, "len=", len(r.text or ""))
