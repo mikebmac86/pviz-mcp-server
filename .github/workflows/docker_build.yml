@@ -4,7 +4,7 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ main ]
 
@@ -44,7 +44,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: ./mcp_server
+          context: .
+          file: mcp_server/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
