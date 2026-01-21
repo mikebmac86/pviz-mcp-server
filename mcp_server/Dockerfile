@@ -8,10 +8,8 @@ RUN apt-get update && apt-get install -y \
 
 COPY mcp_server/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-
-
-# Copy application code
 COPY . .
+ENV PYTHONPATH=/app
 
 ENV PORT=8080
 ENV HOST=0.0.0.0

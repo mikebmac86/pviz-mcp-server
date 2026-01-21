@@ -31,8 +31,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
-from pviz_mcp_server import mcp
-from auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
+from .pviz_mcp_server import mcp
+from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS  # type: ignore
 
 # -----------------------------------------------------------------------------
 # Option A: Request-scoped bearer + session binding
