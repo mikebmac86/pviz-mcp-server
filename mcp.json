@@ -154,9 +154,7 @@
   "installation": {
     "type": "stdio",
     "command": "python",
-    "args": [
-      "pviz_mcp_server.py"
-    ],
+    "args": ["-m", "mcp_server.pviz_mcp_server"],
     "env": {
       "PVIZ_JWT_TOKEN": {
         "required": true,
