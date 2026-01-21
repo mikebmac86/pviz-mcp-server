@@ -6,15 +6,20 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install dependencies (requirements file lives inside the package folder in the repo)
 COPY mcp_server/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the whole repo so /app/mcp_server exists (Option B package layout)
 COPY . .
-ENV PYTHONPATH=/app
 
 ENV PORT=8080
 ENV HOST=0.0.0.0
 ENV PVIZ_API_URL=https://api.pvizgenerator.com
 ENV LOG_LEVEL=info
+
+# Make sure Python can import `mcp_server.*` from /app
+ENV PYTHONPATH=/app
 
 EXPOSE 8080
 
