@@ -451,7 +451,7 @@ _configure_mcp_transport_security()
 
 # MCP SDK SSE ASGI app (this is what clients talk to at /mcp/*)
 print(f"[pviz_mcp_http] Creating SSE app from mcp.sse_app()...", file=sys.stderr)
-mcp_asgi_app = DebugMcpMessagesMiddleware(mcp.sse_app())
+mcp_asgi_app = mcp.sse_app()
 print(f"[pviz_mcp_http] SSE app created: {type(mcp_asgi_app)}", file=sys.stderr)
 
 routes = [
