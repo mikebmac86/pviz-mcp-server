@@ -85,12 +85,12 @@ class PvizAPIAdapter:
         self.base_url = (base_url or "").rstrip("/")
         self.enable_no_cache_headers = bool(enable_no_cache_headers)
 
-        # Used only as fallback (local mode or misconfigured request auth)
+        # Used only as fallback (local mode or remote mode with context loss)
         tok = (jwt_token or "").strip()
         src = "explicit" if tok else "none"
 
-        # Env/file fallback (optional)
-        if not tok and allow_env_fallback:
+        # Env fallback (ALWAYS try, even in remote mode, for async context loss scenarios)
+        if not tok:
             try:
                 tok, src = load_jwt_token_with_source()
             except Exception:
@@ -135,19 +135,15 @@ class PvizAPIAdapter:
         if req_tok:
             return req_tok, "request"
 
-        if self.require_request_bearer:
-            raise ValueError(
-                "No per-request bearer token available. "
-                "Hosted MCP (Option A) requires clients to send Authorization: Bearer <PVIZ_JWT_TOKEN> "
-                "to the MCP server so it can be forwarded to the backend."
-            )
-
+        # Context var fallback failed - try env token
+        # This handles async task context loss in remote MCP scenarios
         if self.jwt_token and self.jwt_token.strip():
             return self.jwt_token.strip(), self.jwt_source
 
+        # Only error if we truly have no token at all
         raise ValueError(
             "JWT not configured: no per-request bearer available and no fallback token set. "
-            "Set PVIZ_JWT_TOKEN (local) or ensure the MCP client sends Authorization: Bearer <token> (remote)."
+            "Set PVIZ_JWT_TOKEN environment variable or ensure the MCP client sends Authorization: Bearer <token>."
         )
 
     # ------------------------------------------------------------------

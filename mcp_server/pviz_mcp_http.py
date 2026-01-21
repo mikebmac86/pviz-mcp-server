@@ -33,6 +33,7 @@ from starlette.routing import Mount, Route
 
 from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS, PVIZ_SESSION_ID
 from .pviz_mcp_server import mcp
+from .api_adapter import token_fingerprint
 
 
 # -----------------------------------------------------------------------------
@@ -263,62 +264,98 @@ class DebugMcpMessagesMiddleware:
         except Exception:
             return repr(bb)
 
-    async def __call__(self, scope, receive, send) -> None:
-        if not self.enabled or scope.get("type") != "http":
-            await self.app(scope, receive, send)
-            return
+async def __call__(self, scope, receive, send) -> None:
+    if scope.get("type") != "http":
+        await self.app(scope, receive, send)
+        return
 
-        path = scope.get("path", "") or ""
-        # In the mounted sub-app, paths are typically "/sse" and "/messages"
-        if not (path == "/messages" or path.startswith("/messages")):
-            await self.app(scope, receive, send)
-            return
+    # Extract headers
+    hdrs: Dict[str, str] = {}
+    for k, v in (scope.get("headers") or []):
+        try:
+            hdrs[k.decode("latin-1").lower()] = v.decode("latin-1")
+        except Exception:
+            continue
 
-        method = scope.get("method", "?")
+    auth = hdrs.get("authorization", "")
+    bearer = _parse_bearer(auth)
+    path = scope.get("path", "")
+
+    # For SSE connections to /mcp/sse, we need to intercept the response
+    # to extract the session_id from the endpoint event and bind the token
+    if path.endswith("/sse") and bearer:
+        # Wrap send to intercept SSE events
+        original_send = send
+        session_id_found = [None]  # Use list for closure mutation
+        
+        async def intercepting_send(message):
+            if message["type"] == "http.response.body":
+                body = message.get("body", b"")
+                if body:
+                    text = body.decode("utf-8", errors="replace")
+                    # Look for endpoint event with session_id
+                    if "event: endpoint" in text or "event:endpoint" in text:
+                        for line in text.split("\n"):
+                            if "session_id=" in line:
+                                # Extract session_id from URL in data line
+                                if "session_id=" in line:
+                                    sid = line.split("session_id=")[1].split("&")[0].split()[0]
+                                    if sid and not session_id_found[0]:
+                                        session_id_found[0] = sid
+                                        SESSION_BEARERS.set(sid, bearer)
+                                        if DEBUG_AUTH:
+                                            _log_auth(
+                                                "SSE session bind: session_id=", sid[:8],
+                                                "token_fp=", token_fingerprint(bearer)[:8]
+                                            )
+                                break
+            await original_send(message)
+        
+        token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
+        session_ctx = PVIZ_SESSION_ID.set(None)
+        try:
+            await self.app(scope, receive, intercepting_send)
+        finally:
+            PVIZ_REQUEST_BEARER.reset(token_ctx)
+            PVIZ_SESSION_ID.reset(session_ctx)
+        return
+
+    # Extract session_id from query string (for /messages endpoint)
+    session_id = ""
+    try:
         qs = (scope.get("query_string") or b"").decode("utf-8", errors="replace")
+        for part in qs.split("&"):
+            if part.startswith("session_id="):
+                session_id = part.split("=", 1)[1]
+                break
+    except Exception:
+        session_id = ""
 
-        headers: Dict[str, str] = {}
-        for k, v in (scope.get("headers") or []):
-            try:
-                headers[k.decode("latin-1").lower()] = v.decode("latin-1")
-            except Exception:
-                continue
+    # Bind token when present
+    if bearer and session_id:
+        SESSION_BEARERS.set(session_id, bearer)
 
-        auth_present = "authorization" in headers
+    # Fallback: if token missing but we have session_id, try store
+    if (not bearer) and session_id:
+        bearer = SESSION_BEARERS.get(session_id)
 
-        # Drain full request body, then replay downstream
-        chunks: List[bytes] = []
-        more = True
-        while more:
-            msg = await receive()
-            if msg.get("type") != "http.request":
-                continue
-            chunks.append(msg.get("body") or b"")
-            more = bool(msg.get("more_body"))
+    token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
+    session_ctx = PVIZ_SESSION_ID.set(session_id if session_id else None)
 
-        body = b"".join(chunks)
-        preview = self._preview_bytes(body)
-
-        _log_http(f"DEBUG {method} {path}?{qs}")
-        _log_http(
-            "DEBUG headers:",
-            f"content-type={headers.get('content-type')}",
-            f"len={headers.get('content-length')}",
-            f"auth={'yes' if auth_present else 'no'}",
+    if DEBUG_AUTH and (path.endswith("/sse") or path.endswith("/messages") or "/messages" in path):
+        _log_auth(
+            "AUTH_BIND:",
+            "path=", path,
+            "bearer_present=", bool(bearer),
+            "session_id=", session_id[:8] if session_id else "none",
+            "token_fp=", token_fingerprint(bearer)[:8] if bearer else "none",
         )
-        _log_http(f"DEBUG body_len={len(body)} body_preview={preview!r}")
 
-        sent = False
-
-        async def replay_receive():
-            nonlocal sent
-            if sent:
-                return {"type": "http.request", "body": b"", "more_body": False}
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
-
-        await self.app(scope, replay_receive, send)
-
+    try:
+        await self.app(scope, receive, send)
+    finally:
+        PVIZ_REQUEST_BEARER.reset(token_ctx)
+        PVIZ_SESSION_ID.reset(session_ctx)
 
 # -----------------------------------------------------------------------------
 # MCP transport security configuration
