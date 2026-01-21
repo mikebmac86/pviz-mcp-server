@@ -1,14 +1,13 @@
 # mcp-server/api_adapter.py
 from __future__ import annotations
 
+import hashlib
 import os
 import time
-import hashlib
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
-
 
 from .auth_context import PVIZ_REQUEST_BEARER  # type: ignore
 
@@ -18,7 +17,11 @@ _HAS_REQUEST_BEARER = True
 # Token loading (single source of truth) + non-sensitive fingerprinting
 # ==============================================================================
 
+
 def _read_text_file(path: str) -> str:
+    """
+    NOTE: currently unused (kept for potential future PVIZ_JWT_TOKEN_FILE support).
+    """
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
@@ -28,7 +31,7 @@ def load_jwt_token_with_source() -> Tuple[str, str]:
     Load JWT token from:
       1) PVIZ_JWT_TOKEN (direct env)
 
-    Returns: (token, source) where source is 'env' or 'file'
+    Returns: (token, source) where source is 'env'
     Raises: ValueError if not configured.
     """
     tok = os.getenv("PVIZ_JWT_TOKEN")
@@ -64,7 +67,7 @@ class PvizAPIAdapter:
     Option A behavior:
       - Prefer *per-request* bearer token (from PVIZ_REQUEST_BEARER) if available.
       - Fall back to explicit jwt_token passed to __init__.
-      - Fall back to env/file only if allow_env_fallback=True.
+      - Fall back to env token (PVIZ_JWT_TOKEN).
 
     Notes:
       - Artifact URLs should be obtained from:
@@ -82,6 +85,8 @@ class PvizAPIAdapter:
         prefer_request_bearer: bool = True,
         require_request_bearer: bool = False,
     ):
+        # NOTE: allow_env_fallback is currently not enforced to preserve existing behavior
+        # (env is always attempted when no explicit token is provided).
         self.base_url = (base_url or "").rstrip("/")
         self.enable_no_cache_headers = bool(enable_no_cache_headers)
 
@@ -97,7 +102,7 @@ class PvizAPIAdapter:
                 tok, src = "", "none"
 
         self.jwt_token = tok
-        self.jwt_source = src  # 'explicit' | 'env' | 'file' | 'none'
+        self.jwt_source = src  # 'explicit' | 'env' | 'none'
 
         self.prefer_request_bearer = bool(prefer_request_bearer)
         self.require_request_bearer = bool(require_request_bearer)
@@ -113,9 +118,10 @@ class PvizAPIAdapter:
             v = PVIZ_REQUEST_BEARER.get()
             if v and isinstance(v, str) and v.strip():
                 return v.strip()
-            
+
             # Fallback: try session store (for async task context loss)
             from .auth_context import PVIZ_SESSION_ID, SESSION_BEARERS
+
             session_id = PVIZ_SESSION_ID.get()
             if session_id:
                 tok = SESSION_BEARERS.get(session_id)
@@ -130,17 +136,16 @@ class PvizAPIAdapter:
         Returns (token, source) where source is:
           - "request" if per-request bearer is available
           - otherwise self.jwt_source
+
+        NOTE: require_request_bearer is not enforced here to preserve existing behavior.
         """
         req_tok = self._get_request_bearer() if self.prefer_request_bearer else None
         if req_tok:
             return req_tok, "request"
 
-        # Context var fallback failed - try env token
-        # This handles async task context loss in remote MCP scenarios
         if self.jwt_token and self.jwt_token.strip():
             return self.jwt_token.strip(), self.jwt_source
 
-        # Only error if we truly have no token at all
         raise ValueError(
             "JWT not configured: no per-request bearer available and no fallback token set. "
             "Set PVIZ_JWT_TOKEN environment variable or ensure the MCP client sends Authorization: Bearer <token>."
@@ -168,6 +173,85 @@ class PvizAPIAdapter:
             out["cb"] = int(time.time() * 1000)
         return out
 
+    def _wrap_dict(self, data: Any) -> Dict[str, Any]:
+        return data if isinstance(data, dict) else {"value": data}
+
+    def _normalize_collection(
+        self,
+        data: Any,
+        *,
+        out_key: str,
+        dict_keys: Tuple[str, ...],
+        total_key: str = "total",
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Normalize backend responses that can be either:
+          - list
+          - dict with items under one of dict_keys
+        into: {"total": <int>, out_key: <list>}
+        """
+        if isinstance(data, list):
+            items = data
+            if limit is not None:
+                items = items[:limit]
+            return {"total": len(data), out_key: items}
+
+        if isinstance(data, dict):
+            for k in dict_keys:
+                if k in data:
+                    items = data.get(k) or []
+                    if isinstance(items, list) and limit is not None:
+                        items = items[:limit]
+                    total = data.get(total_key)
+                    if total is None:
+                        total = len(items) if isinstance(items, list) else 0
+                    return {"total": int(total), out_key: items}
+
+        return {"total": 0, out_key: []}
+
+    async def _get_json(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_s: float = 30.0,
+        force_fresh: bool = True,
+        force_no_cache: bool = False,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        resp = await client.get(
+            url,
+            headers=self._headers(force_no_cache=force_no_cache),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _post_json(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        *,
+        json: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_s: float = 30.0,
+        force_fresh: bool = False,
+        force_no_cache: bool = False,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        resp = await client.post(
+            url,
+            headers=self._headers(force_no_cache=force_no_cache),
+            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
+            json=json,
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def debug_token_info(self) -> Dict[str, Any]:
         """
         Non-sensitive debug info to confirm which JWT and API base URL the MCP server is using.
@@ -194,7 +278,7 @@ class PvizAPIAdapter:
             info["token_fingerprint"] = "none"
             info["token_error"] = f"{type(e).__name__}: {e}"
 
-        # Also include fallback fingerprint (useful to detect accidental env/file use)
+        # Also include fallback fingerprint (useful to detect accidental env use)
         if self.jwt_token:
             info["fallback_token_source"] = self.jwt_source
             info["fallback_token_fingerprint"] = token_fingerprint(self.jwt_token)
@@ -215,16 +299,15 @@ class PvizAPIAdapter:
         """
         GET /auth/me
         """
-        endpoint = f"{self.base_url}/auth/me"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/auth/me",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     # ========================================================================
     # TOKENS (balance + overview + ledger)
@@ -240,15 +323,15 @@ class PvizAPIAdapter:
         """
         GET /tokens/balance
         """
-        endpoint = f"{self.base_url}/tokens/balance"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/tokens/balance",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json() or {}
+        data = data or {}
         if not isinstance(data, dict):
             return {"value": data}
         return data
@@ -263,15 +346,15 @@ class PvizAPIAdapter:
         """
         GET /tokens/overview
         """
-        endpoint = f"{self.base_url}/tokens/overview"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/tokens/overview",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json() or {}
+        data = data or {}
         if not isinstance(data, dict):
             data = {"value": data}
 
@@ -295,20 +378,20 @@ class PvizAPIAdapter:
         """
         GET /tokens/transactions?skip=&limit=
         """
-        endpoint = f"{self.base_url}/tokens/transactions"
         skip_i = max(0, int(skip or 0))
         limit_i = max(1, min(int(limit or 50), 200))
         params: Dict[str, Any] = {"skip": skip_i, "limit": limit_i}
 
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/tokens/transactions",
+            params=params,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
+        # Preserve existing tolerance for multiple response shapes
         if isinstance(data, list):
             return {"total": len(data), "transactions": data}
 
@@ -361,16 +444,15 @@ class PvizAPIAdapter:
         """
         GET /trial/entitlement
         """
-        endpoint = f"{self.base_url}/trial/entitlement"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/trial/entitlement",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     async def get_trial_ledger(
         self,
@@ -384,19 +466,18 @@ class PvizAPIAdapter:
         """
         GET /trial/ledger?skip=&limit=
         """
-        endpoint = f"{self.base_url}/trial/ledger"
         skip_i = max(0, int(skip or 0))
         limit_i = max(1, min(int(limit or 50), 200))
         params: Dict[str, Any] = {"skip": skip_i, "limit": limit_i}
 
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/trial/ledger",
+            params=params,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         if isinstance(data, list):
             return {"total": len(data), "entries": data}
@@ -424,17 +505,15 @@ class PvizAPIAdapter:
         """
         GET /store/products?active_only=1
         """
-        endpoint = f"{self.base_url}/store/products"
         params: Dict[str, Any] = {"active_only": 1 if active_only else 0}
-
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=False),
-            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/store/products",
+            params=params,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=False,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         if isinstance(data, list):
             return {"total": len(data), "products": data}
@@ -459,19 +538,18 @@ class PvizAPIAdapter:
         """
         GET /store/orders?limit=&skip=
         """
-        endpoint = f"{self.base_url}/store/orders"
         limit_i = max(1, min(int(limit or 20), 100))
         skip_i = max(0, int(skip or 0))
         params: Dict[str, Any] = {"limit": limit_i, "skip": skip_i}
 
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/store/orders",
+            params=params,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         if isinstance(data, list):
             return {"total": len(data), "orders": data}
@@ -495,16 +573,15 @@ class PvizAPIAdapter:
         """
         GET /store/orders/{order_id}
         """
-        endpoint = f"{self.base_url}/store/orders/{order_id}"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            f"/store/orders/{order_id}",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     # ========================================================================
     # COST ESTIMATION + JOBS
@@ -521,21 +598,19 @@ class PvizAPIAdapter:
         """
         POST /estimate/github
         """
-        endpoint = f"{self.base_url}/estimate/github"
         repo_spec = self._parse_repo_url(repo_url)
         payload: Dict[str, Any] = {"repo_spec": repo_spec}
         if github_token:
             payload["github_token"] = github_token
 
-        resp = await client.post(
-            endpoint,
-            headers=self._headers(force_no_cache=False),
+        data = await self._post_json(
+            client,
+            "/estimate/github",
             json=payload,
-            timeout=timeout_s,
+            timeout_s=timeout_s,
+            force_no_cache=False,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     async def submit_analysis(
         self,
@@ -552,11 +627,15 @@ class PvizAPIAdapter:
         """
         POST /jobs/github
         """
-        endpoint = f"{self.base_url}/jobs/github"
         repo_spec = self._parse_repo_url(repo_url)
 
         if expected_tokens is None:
-            estimate = await self.estimate_cost(client, repo_url, github_token, timeout_s=timeout_s)
+            estimate = await self.estimate_cost(
+                client,
+                repo_url,
+                github_token=github_token,
+                timeout_s=timeout_s,
+            )
             expected_tokens = int(estimate.get("tokens_needed") or 0)
 
         payload: Dict[str, Any] = {
@@ -573,15 +652,14 @@ class PvizAPIAdapter:
         if pricing_choice == "trial_credit":
             payload["use_trial_credit_requested"] = True
 
-        resp = await client.post(
-            endpoint,
-            headers=self._headers(force_no_cache=False),
+        data = await self._post_json(
+            client,
+            "/jobs/github",
             json=payload,
-            timeout=timeout_s,
+            timeout_s=timeout_s,
+            force_no_cache=False,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     async def get_job_status(
         self,
@@ -594,16 +672,15 @@ class PvizAPIAdapter:
         """
         GET /jobs/{job_id}
         """
-        endpoint = f"{self.base_url}/jobs/{job_id}"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            f"/jobs/{job_id}",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     async def get_job_history(
         self,
@@ -617,18 +694,17 @@ class PvizAPIAdapter:
         """
         GET /jobs?limit=&skip=
         """
-        endpoint = f"{self.base_url}/jobs"
         limit_i = max(1, min(int(limit), 50))
         skip_i = max(0, int(skip))
 
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache({"skip": skip_i, "limit": limit_i}, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            "/jobs",
+            params={"skip": skip_i, "limit": limit_i},
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         if isinstance(data, list):
             return {"total": len(data), "jobs": data[:limit_i]}
@@ -652,15 +728,14 @@ class PvizAPIAdapter:
         """
         POST /jobs/{job_id}/cancel
         """
-        endpoint = f"{self.base_url}/jobs/{job_id}/cancel"
-        resp = await client.post(
-            endpoint,
-            headers=self._headers(force_no_cache=False),
-            timeout=timeout_s,
+        data = await self._post_json(
+            client,
+            f"/jobs/{job_id}/cancel",
+            json=None,
+            timeout_s=timeout_s,
+            force_no_cache=False,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     # ------------------------------------------------------------------------
     # Artifacts (dual-format only; no legacy shim)
@@ -678,17 +753,15 @@ class PvizAPIAdapter:
         """
         GET /jobs/{job_id}/artifact-links?prefer=standard|compressed|both
         """
-        endpoint = f"{self.base_url}/jobs/{job_id}/artifact-links"
-        params = {"prefer": prefer}
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(params, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            f"/jobs/{job_id}/artifact-links",
+            params={"prefer": prefer},
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     async def get_job_artifacts(
         self,
@@ -718,17 +791,14 @@ class PvizAPIAdapter:
 
         if job:
             af = job.get("artifact_formats")
-            # Check if artifact_formats exists and has at least one format
             if isinstance(af, dict) and (af.get("standard") or af.get("compressed")):
-                # Filter based on preference
                 if prefer == "standard":
                     result_af = {"standard": af.get("standard"), "compressed": None}
                 elif prefer == "compressed":
                     result_af = {"standard": None, "compressed": af.get("compressed")}
-                else:  # "both" or default
+                else:
                     result_af = {"standard": af.get("standard"), "compressed": af.get("compressed")}
 
-                # Validate we got what we requested
                 has_requested = (
                     (prefer == "standard" and result_af.get("standard"))
                     or (prefer == "compressed" and result_af.get("compressed"))
@@ -749,12 +819,8 @@ class PvizAPIAdapter:
                 client, job_id, prefer=prefer, timeout_s=timeout_s, force_fresh=force_fresh
             )
             af2 = links.get("artifact_formats")
-            if isinstance(af2, dict):
-                normalized = af2
-            else:
-                normalized = links
+            normalized: Any = af2 if isinstance(af2, dict) else links
 
-            # Basic sanity check - ensure we have at least one format
             if isinstance(normalized, dict) and (normalized.get("standard") or normalized.get("compressed")):
                 return {
                     "job_id": job_id,
@@ -781,16 +847,15 @@ class PvizAPIAdapter:
         """
         GET /jobs/{job_id}/llm-report
         """
-        endpoint = f"{self.base_url}/jobs/{job_id}/llm-report"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            f"/jobs/{job_id}/llm-report",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     async def get_llm_result(
         self,
@@ -803,16 +868,15 @@ class PvizAPIAdapter:
         """
         GET /jobs/{job_id}/llm-result
         """
-        endpoint = f"{self.base_url}/jobs/{job_id}/llm-result"
-        resp = await client.get(
-            endpoint,
-            headers=self._headers(force_no_cache=True),
-            params=self._maybe_bust_cache(None, force_fresh=force_fresh),
-            timeout=timeout_s,
+        data = await self._get_json(
+            client,
+            f"/jobs/{job_id}/llm-result",
+            params=None,
+            timeout_s=timeout_s,
+            force_fresh=force_fresh,
+            force_no_cache=True,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {"value": data}
+        return self._wrap_dict(data)
 
     # ========================================================================
     # Helper methods

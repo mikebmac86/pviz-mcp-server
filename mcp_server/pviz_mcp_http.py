@@ -22,26 +22,31 @@ import asyncio
 import os
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
-from .auth_context import PVIZ_REQUEST_BEARER, SESSION_BEARERS, PVIZ_SESSION_ID
-from .pviz_mcp_server import mcp
+from .auth_context import PVIZ_REQUEST_BEARER, PVIZ_SESSION_ID, SESSION_BEARERS
 from .api_adapter import token_fingerprint
-
+from .pviz_mcp_server import mcp
 
 # -----------------------------------------------------------------------------
-# Option A: Request-scoped bearer + session binding
+# Time helper (kept minimal; useful for debugging / TTL stores)
 # -----------------------------------------------------------------------------
+
 
 def _now_s() -> float:
     return time.time()
+
+
+# -----------------------------------------------------------------------------
+# Auth parsing
+# -----------------------------------------------------------------------------
 
 
 def _parse_bearer(auth_header: str) -> Optional[str]:
@@ -59,6 +64,7 @@ def _parse_bearer(auth_header: str) -> Optional[str]:
 # -----------------------------------------------------------------------------
 # Env helpers / parsing
 # -----------------------------------------------------------------------------
+
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -131,44 +137,82 @@ def _expand_host_variants_for_mcp(hosts: List[str]) -> List[str]:
 
 
 # -----------------------------------------------------------------------------
+# Scope parsing helpers (consolidated)
+# -----------------------------------------------------------------------------
+
+
+def _headers_dict(scope) -> Dict[str, str]:
+    hdrs: Dict[str, str] = {}
+    for k, v in (scope.get("headers") or []):
+        try:
+            hdrs[k.decode("latin-1").lower()] = v.decode("latin-1")
+        except Exception:
+            continue
+    return hdrs
+
+
+def _session_id_from_scope(scope) -> str:
+    # Keep exact behavior: manual query string scan for session_id=
+    session_id = ""
+    try:
+        qs = (scope.get("query_string") or b"").decode("utf-8", errors="replace")
+        for part in qs.split("&"):
+            if part.startswith("session_id="):
+                session_id = part.split("=", 1)[1]
+                break
+    except Exception:
+        session_id = ""
+    return session_id.strip()
+
+
+def _bearer_from_scope(scope) -> Optional[str]:
+    hdrs = _headers_dict(scope)
+    return _parse_bearer(hdrs.get("authorization", ""))
+
+
+def _path_from_scope(scope) -> str:
+    return (scope.get("path", "") or "").strip()
+
+
+# -----------------------------------------------------------------------------
 # Debug logging (stderr only)
 # -----------------------------------------------------------------------------
+
 
 DEBUG_HTTP = _bool_env("MCP_DEBUG_HTTP", False)
 DEBUG_AUTH = _bool_env("MCP_DEBUG_AUTH_BIND", False)
 DEBUG_TRANSPORT_SECURITY = _bool_env("MCP_DEBUG_TRANSPORT_SECURITY", True)
 
 
-def _log_http(*parts: object) -> None:
-    if not DEBUG_HTTP:
-        return
+def _log(prefix: str, *parts: object) -> None:
     try:
-        print("[pviz_mcp_http][http]", *parts, file=sys.stderr, flush=True)
+        print(prefix, *parts, file=sys.stderr, flush=True)
     except Exception:
         pass
+
+
+def _log_http(*parts: object) -> None:
+    if DEBUG_HTTP:
+        _log("[pviz_mcp_http][http]", *parts)
 
 
 def _log_auth(*parts: object) -> None:
-    if not DEBUG_AUTH:
-        return
-    try:
-        print("[pviz_mcp_http][auth]", *parts, file=sys.stderr, flush=True)
-    except Exception:
-        pass
+    if DEBUG_AUTH:
+        _log("[pviz_mcp_http][auth]", *parts)
 
 
 def _log_ts(*parts: object) -> None:
-    if not DEBUG_TRANSPORT_SECURITY:
-        return
-    try:
-        print(*parts, file=sys.stderr, flush=True)
-    except Exception:
-        pass
+    if DEBUG_TRANSPORT_SECURITY:
+        _log("", *parts)  # preserves your "raw" TS prints
 
 
 # -----------------------------------------------------------------------------
 # ASGI middleware (SSE-safe): Auth binder
+#
+# NOTE: We avoid Starlette BaseHTTPMiddleware because it can break streaming
+# responses (StreamingResponse / SSE). This is ASGI-native and streaming-safe.
 # -----------------------------------------------------------------------------
+
 
 class MCPAuthBindMiddleware:
     """
@@ -178,7 +222,7 @@ class MCPAuthBindMiddleware:
     and sets PVIZ_REQUEST_BEARER contextvar for downstream handling.
 
     IMPORTANT:
-      - Must wrap the MCP sub-app (mounted at /mcp), not the top Starlette app,
+      - Wrap the MCP sub-app (mounted at /mcp), not the top Starlette app,
         unless you're prepared to lose Starlette methods like add_middleware().
     """
 
@@ -190,47 +234,30 @@ class MCPAuthBindMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Extract headers
-        hdrs: Dict[str, str] = {}
-        for k, v in (scope.get("headers") or []):
-            try:
-                hdrs[k.decode("latin-1").lower()] = v.decode("latin-1")
-            except Exception:
-                continue
+        bearer = _bearer_from_scope(scope)
+        session_id = _session_id_from_scope(scope)
+        path = _path_from_scope(scope)
 
-        auth = hdrs.get("authorization", "")
-        bearer = _parse_bearer(auth)
-
-        # Extract session_id from query string
-        session_id = ""
-        try:
-            qs = (scope.get("query_string") or b"").decode("utf-8", errors="replace")
-            for part in qs.split("&"):
-                if part.startswith("session_id="):
-                    session_id = part.split("=", 1)[1]
-                    break
-        except Exception:
-            session_id = ""
-
-        # Bind token when present
+        # Bind token when present (authoritative; overwrites prior mapping).
         if bearer and session_id:
-            SESSION_BEARERS.set(session_id, bearer)  # Remove await
+            SESSION_BEARERS.set(session_id, bearer)
 
         # Fallback: if token missing but we have session_id, try store
         if (not bearer) and session_id:
-            bearer = SESSION_BEARERS.get(session_id)  # Remove await
+            bearer = SESSION_BEARERS.get(session_id)
 
         token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
         session_ctx = PVIZ_SESSION_ID.set(session_id if session_id else None)
 
-        path = scope.get("path", "")
-        if DEBUG_AUTH and (path.endswith("/sse") or path.endswith("/messages") or "/messages" in path):
+        if DEBUG_AUTH and (
+            path.endswith("/sse") or path.endswith("/messages") or "/messages" in path
+        ):
             _log_auth(
                 "AUTH_BIND",
                 "path=", path,
                 "session_id=", "yes" if bool(session_id) else "no",
-                "auth_header=", "yes" if bool(auth) else "no",
-                "bearer_bound=", "yes" if bool(bearer) else "no",
+                "bearer_present=", "yes" if bool(bearer) else "no",
+                "token_fp=", token_fingerprint(bearer)[:8] if bearer else "none",
             )
 
         try:
@@ -239,129 +266,88 @@ class MCPAuthBindMiddleware:
             PVIZ_REQUEST_BEARER.reset(token_ctx)
             PVIZ_SESSION_ID.reset(session_ctx)
 
+
 # -----------------------------------------------------------------------------
-# ASGI middleware (SSE-safe): Debug /mcp/messages body without breaking streaming
+# Optional SSE endpoint sniffing middleware (SSE-safe)
+#
+# Purpose:
+#   Some MCP clients send Authorization only on /mcp/sse but not on /mcp/messages.
+#   In that case, we need to learn session_id from the "endpoint" SSE event and
+#   bind session_id -> bearer early so /messages can look it up.
+#
+# This middleware is purely additive:
+#   - It does NOT set ContextVars (binder does that).
+#   - It ONLY populates SESSION_BEARERS when it can extract a session_id.
+#
+# Enable via: MCP_BIND_FROM_SSE_ENDPOINT=1
 # -----------------------------------------------------------------------------
 
-class DebugMcpMessagesMiddleware:
-    """
-    ASGI-native debug middleware that is SAFE for StreamingResponse / SSE.
 
-    Only triggers on /messages (inside the mounted /mcp sub-app).
-    """
-
-    def __init__(self, app, enabled: bool = True, max_preview: int = 300) -> None:
+class MCPSseEndpointSessionBindMiddleware:
+    def __init__(self, app, enabled: bool = False, max_scan: int = 4096) -> None:
         self.app = app
         self.enabled = enabled
-        self.max_preview = max_preview
+        self.max_scan = max_scan
 
-    def _preview_bytes(self, b: bytes) -> str:
-        if not b:
-            return ""
-        bb = b[: self.max_preview]
-        try:
-            return bb.decode("utf-8", errors="replace")
-        except Exception:
-            return repr(bb)
+    async def __call__(self, scope, receive, send) -> None:
+        if not self.enabled or scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
 
-async def __call__(self, scope, receive, send) -> None:
-    if scope.get("type") != "http":
-        await self.app(scope, receive, send)
-        return
+        path = _path_from_scope(scope)
+        if not path.endswith("/sse"):
+            await self.app(scope, receive, send)
+            return
 
-    # Extract headers
-    hdrs: Dict[str, str] = {}
-    for k, v in (scope.get("headers") or []):
-        try:
-            hdrs[k.decode("latin-1").lower()] = v.decode("latin-1")
-        except Exception:
-            continue
+        bearer = _bearer_from_scope(scope)
+        if not bearer:
+            await self.app(scope, receive, send)
+            return
 
-    auth = hdrs.get("authorization", "")
-    bearer = _parse_bearer(auth)
-    path = scope.get("path", "")
-
-    # For SSE connections to /mcp/sse, we need to intercept the response
-    # to extract the session_id from the endpoint event and bind the token
-    if path.endswith("/sse") and bearer:
-        # Wrap send to intercept SSE events
         original_send = send
-        session_id_found = [None]  # Use list for closure mutation
-        
-        async def intercepting_send(message):
-            if message["type"] == "http.response.body":
-                body = message.get("body", b"")
-                if body:
-                    text = body.decode("utf-8", errors="replace")
-                    # Look for endpoint event with session_id
-                    if "event: endpoint" in text or "event:endpoint" in text:
+        buffer = bytearray()
+        bound_sid: Optional[str] = None
+
+        async def intercept_send(message):
+            nonlocal bound_sid
+            if message.get("type") == "http.response.body":
+                body = message.get("body", b"") or b""
+                if body and bound_sid is None and len(buffer) < self.max_scan:
+                    buffer.extend(body[: max(0, self.max_scan - len(buffer))])
+                    text = buffer.decode("utf-8", errors="replace")
+
+                    # Look for endpoint event with a URL containing session_id=
+                    # Keep parsing permissive; bind the first SID we see.
+                    if "session_id=" in text and ("event: endpoint" in text or "event:endpoint" in text):
+                        # Typical SSE format has lines; a "data:" line may contain the URL
                         for line in text.split("\n"):
                             if "session_id=" in line:
-                                # Extract session_id from URL in data line
-                                if "session_id=" in line:
-                                    sid = line.split("session_id=")[1].split("&")[0].split()[0]
-                                    if sid and not session_id_found[0]:
-                                        session_id_found[0] = sid
-                                        SESSION_BEARERS.set(sid, bearer)
-                                        if DEBUG_AUTH:
-                                            _log_auth(
-                                                "SSE session bind: session_id=", sid[:8],
-                                                "token_fp=", token_fingerprint(bearer)[:8]
-                                            )
+                                sid = line.split("session_id=", 1)[1]
+                                sid = sid.split("&", 1)[0]
+                                sid = sid.split(None, 1)[0]
+                                sid = sid.strip()
+                                if sid:
+                                    bound_sid = sid
+                                    SESSION_BEARERS.set(sid, bearer)
+                                    if DEBUG_AUTH:
+                                        _log_auth(
+                                            "SSE_ENDPOINT_BIND",
+                                            "session_id=", sid[:8],
+                                            "token_fp=", token_fingerprint(bearer)[:8],
+                                        )
                                 break
+
             await original_send(message)
-        
-        token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
-        session_ctx = PVIZ_SESSION_ID.set(None)
-        try:
-            await self.app(scope, receive, intercepting_send)
-        finally:
-            PVIZ_REQUEST_BEARER.reset(token_ctx)
-            PVIZ_SESSION_ID.reset(session_ctx)
-        return
 
-    # Extract session_id from query string (for /messages endpoint)
-    session_id = ""
-    try:
-        qs = (scope.get("query_string") or b"").decode("utf-8", errors="replace")
-        for part in qs.split("&"):
-            if part.startswith("session_id="):
-                session_id = part.split("=", 1)[1]
-                break
-    except Exception:
-        session_id = ""
+        await self.app(scope, receive, intercept_send)
 
-    # Bind token when present
-    if bearer and session_id:
-        SESSION_BEARERS.set(session_id, bearer)
-
-    # Fallback: if token missing but we have session_id, try store
-    if (not bearer) and session_id:
-        bearer = SESSION_BEARERS.get(session_id)
-
-    token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
-    session_ctx = PVIZ_SESSION_ID.set(session_id if session_id else None)
-
-    if DEBUG_AUTH and (path.endswith("/sse") or path.endswith("/messages") or "/messages" in path):
-        _log_auth(
-            "AUTH_BIND:",
-            "path=", path,
-            "bearer_present=", bool(bearer),
-            "session_id=", session_id[:8] if session_id else "none",
-            "token_fp=", token_fingerprint(bearer)[:8] if bearer else "none",
-        )
-
-    try:
-        await self.app(scope, receive, send)
-    finally:
-        PVIZ_REQUEST_BEARER.reset(token_ctx)
-        PVIZ_SESSION_ID.reset(session_ctx)
 
 # -----------------------------------------------------------------------------
 # MCP transport security configuration
 # -----------------------------------------------------------------------------
 
-def _configure_mcp_transport_security() -> None:
+
+def _configure_mcp_transport_security() -> Tuple[List[str], List[str]]:
     _log_ts("=" * 80)
     _log_ts("[pviz_mcp_http] TRANSPORT SECURITY CONFIGURATION (DEBUG)")
     _log_ts("=" * 80)
@@ -399,9 +385,6 @@ def _configure_mcp_transport_security() -> None:
             allowed_origins=allowed_origins,
             enable_dns_rebinding_protection=dns_rebinding,
         )
-        _log_ts("[pviz_mcp_http] Created TransportSecuritySettings object")
-        _log_ts(f"[pviz_mcp_http]   ts.allowed_hosts = {ts.allowed_hosts}")
-        _log_ts(f"[pviz_mcp_http]   ts.allowed_origins = {ts.allowed_origins}")
 
         before = getattr(mcp.settings, "transport_security", None)
         _log_ts(f"[pviz_mcp_http]   BEFORE: mcp.settings.transport_security = {before}")
@@ -409,7 +392,7 @@ def _configure_mcp_transport_security() -> None:
         mcp.settings.transport_security = ts
 
         actual = getattr(mcp.settings, "transport_security", None)
-        _log_ts(f"[pviz_mcp_http]   mcp.settings.transport_security = {actual}")
+        _log_ts(f"[pviz_mcp_http]   AFTER:  mcp.settings.transport_security = {actual}")
         if actual:
             _log_ts(f"[pviz_mcp_http]   actual.allowed_hosts = {getattr(actual, 'allowed_hosts', None)}")
             _log_ts(f"[pviz_mcp_http]   actual.allowed_origins = {getattr(actual, 'allowed_origins', None)}")
@@ -420,15 +403,19 @@ def _configure_mcp_transport_security() -> None:
         _log_ts("[pviz_mcp_http] ✗ ERROR: Failed to configure transport security")
         _log_ts(f"[pviz_mcp_http]   Exception: {type(e).__name__}: {e}")
         import traceback
+
         traceback.print_exc(file=sys.stderr)
 
     _log_ts("=" * 80)
     _log_ts("")
 
+    return allowed_hosts, allowed_origins
+
 
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
+
 
 async def health_check(request: Request):
     return JSONResponse({"status": "healthy", "service": "pviz-mcp-server", "transport": "sse"})
@@ -454,6 +441,7 @@ async def info_endpoint(request: Request):
 
 
 async def mcp_redirect(request: Request):
+    # Intentionally redirects /mcp (exact) to /mcp/ while Mount("/mcp") serves /mcp/*
     return RedirectResponse(url="/mcp/", status_code=307)
 
 
@@ -471,32 +459,42 @@ async def oauth_not_supported(request: Request):
 # Configure MCP transport security BEFORE creating the MCP ASGI app
 # -----------------------------------------------------------------------------
 
-_configure_mcp_transport_security()
 
-print("[pviz_mcp_http] Creating SSE app from mcp.sse_app()...", file=sys.stderr)
+_mcp_allowed_hosts, _mcp_allowed_origins = _configure_mcp_transport_security()
+
+_log("[pviz_mcp_http]", "Creating SSE app from mcp.sse_app()...")
 mcp_asgi_app = mcp.sse_app()
-print(f"[pviz_mcp_http] SSE app created: {type(mcp_asgi_app)}", file=sys.stderr)
+_log("[pviz_mcp_http]", f"SSE app created: {type(mcp_asgi_app)}")
 
 # -----------------------------------------------------------------------------
 # Wrap ONLY the mounted /mcp app with SSE-safe ASGI middleware
 # -----------------------------------------------------------------------------
 
+
 mcp_wrapped = mcp_asgi_app
+
+# Optional: bind session_id from SSE "endpoint" event (additive)
+BIND_FROM_SSE_ENDPOINT = _bool_env("MCP_BIND_FROM_SSE_ENDPOINT", False)
+mcp_wrapped = MCPSseEndpointSessionBindMiddleware(
+    mcp_wrapped, enabled=BIND_FROM_SSE_ENDPOINT
+)
+
+# Primary binder: sets ContextVars + binds session_id when present
 mcp_wrapped = MCPAuthBindMiddleware(mcp_wrapped)
-#mcp_wrapped = DebugMcpMessagesMiddleware(mcp_wrapped, enabled=_bool_env("MCP_DEBUG_HTTP", False))
 
 # -----------------------------------------------------------------------------
 # Starlette app (top-level) – remains a real Starlette instance
 # -----------------------------------------------------------------------------
 
+
 routes = [
     Route("/health", endpoint=health_check, methods=["GET"]),
     Route("/", endpoint=info_endpoint, methods=["GET"]),
-    Route("/mcp", endpoint=mcp_redirect, methods=["GET"]),
+    Route("/mcp", endpoint=mcp_redirect, methods=["GET"]),  # exact path
     Route("/.well-known/oauth-protected-resource", endpoint=oauth_not_supported, methods=["GET"]),
     Route("/.well-known/oauth-protected-resource/mcp", endpoint=oauth_not_supported, methods=["GET"]),
     Route("/.well-known/oauth-authorization-server", endpoint=oauth_not_supported, methods=["GET"]),
-    Mount("/mcp", app=mcp_wrapped),
+    Mount("/mcp", app=mcp_wrapped),  # /mcp/*
 ]
 
 app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
@@ -504,6 +502,7 @@ app = Starlette(debug=_bool_env("DEBUG", False), routes=routes)
 # -----------------------------------------------------------------------------
 # Starlette Host allowlist
 # -----------------------------------------------------------------------------
+
 
 starlette_allowed_hosts = _split_csv_env(
     "ALLOWED_HOSTS",
@@ -514,15 +513,16 @@ if _bool_env("PVIZ_ALLOW_ANY_HOST", False):
 
 starlette_allowed_hosts = _starlette_safe_hosts(starlette_allowed_hosts)
 
-print(f"[pviz_mcp_http] Starlette allowed_hosts: {starlette_allowed_hosts}", file=sys.stderr)
+_log("[pviz_mcp_http]", f"Starlette allowed_hosts: {starlette_allowed_hosts}")
 
 if starlette_allowed_hosts:
-    # This is SSE-safe.
+    # SSE-safe.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=starlette_allowed_hosts)
 
 # -----------------------------------------------------------------------------
 # CORS
 # -----------------------------------------------------------------------------
+
 
 cors_origins = _split_csv_env("CORS_ORIGINS", default="")
 if cors_origins:
@@ -534,19 +534,30 @@ if cors_origins:
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
-    print(f"[pviz_mcp_http] CORS enabled for origins: {cors_origins}", file=sys.stderr)
+    _log("[pviz_mcp_http]", f"CORS enabled for origins: {cors_origins}")
 
-print("[pviz_mcp_http] Server initialization complete", file=sys.stderr)
-print(file=sys.stderr)
+# -----------------------------------------------------------------------------
+# Startup configuration summary (helps avoid misconfig)
+# -----------------------------------------------------------------------------
 
+
+_log("[pviz_mcp_http]", "Server initialization complete")
+_log("[pviz_mcp_http]", f"MCP allowed_hosts (expanded): {_mcp_allowed_hosts}")
+_log("[pviz_mcp_http]", f"MCP allowed_origins: {_mcp_allowed_origins}")
+_log("[pviz_mcp_http]", f"Starlette allowed_hosts (sanitized): {starlette_allowed_hosts}")
+_log("[pviz_mcp_http]", f"SSE endpoint bind enabled: {BIND_FROM_SSE_ENDPOINT}")
+_log("[pviz_mcp_http]", "")  # spacer
 
 # -----------------------------------------------------------------------------
 # Optional cleanup loop (safe, off by default)
 # -----------------------------------------------------------------------------
 
+
+CLEANUP_EVERY_S = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
+
+
 async def _cleanup_loop() -> None:
-    every_s = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
-    if every_s <= 0:
+    if CLEANUP_EVERY_S <= 0:
         return
     while True:
         try:
@@ -554,17 +565,16 @@ async def _cleanup_loop() -> None:
             if DEBUG_AUTH:
                 _log_auth("AUTH_BIND cleanup removed=", removed)
         except Exception as e:
-            print(
-                f"[pviz_mcp_http] AUTH_BIND cleanup error: {type(e).__name__}: {e}",
-                file=sys.stderr,
+            _log(
+                "[pviz_mcp_http]",
+                f"AUTH_BIND cleanup error: {type(e).__name__}: {e}",
             )
-        await asyncio.sleep(every_s)
+        await asyncio.sleep(CLEANUP_EVERY_S)
 
 
 @app.on_event("startup")
 async def _on_startup() -> None:
-    every_s = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
-    if every_s > 0:
+    if CLEANUP_EVERY_S > 0:
         asyncio.create_task(_cleanup_loop())
 
 
@@ -575,7 +585,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     log_level = os.getenv("LOG_LEVEL", "info")
 
-    print(f"[pviz_mcp_http] Starting uvicorn server on {host}:{port}", file=sys.stderr)
+    _log("[pviz_mcp_http]", f"Starting uvicorn server on {host}:{port}")
 
     uvicorn.run(
         "pviz_mcp_http:app",

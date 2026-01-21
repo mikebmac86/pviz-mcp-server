@@ -14,7 +14,8 @@ import asyncio
 import httpx
 import random
 import logging
-from typing import Any, Dict, Optional, List
+import json
+from typing import Any, Dict, Optional, List, Callable, Awaitable, Tuple
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -77,7 +78,7 @@ TERMINAL_STATES = TERMINAL_SUCCESS | TERMINAL_FAILURE
 # -----------------------------------------------------------------------------
 # Field Guide for Summary Sections
 # -----------------------------------------------------------------------------
-SUMMARY_FIELD_GUIDE = {
+SUMMARY_FIELD_GUIDE: Dict[str, str] = {
     "counts": "Basic counts of modules, edges, zones, and files",
     "loc": "Lines of code metrics and largest modules",
     "parse_status": "How many files parsed successfully vs errors",
@@ -131,10 +132,35 @@ def _next_step(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     return {"tool": tool_name, "args": args}
 
 
+def _fail(
+    error_code: str,
+    error: str,
+    details: Any = None,
+    *,
+    suggestion: Optional[str] = None,
+    **extras: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"success": False, "error_code": error_code, "error": error}
+    if details is not None:
+        payload["details"] = details
+    if suggestion:
+        payload["suggestion"] = suggestion
+    payload.update(extras)
+    return payload
+
+
+def _invalid_response(details: Any) -> Dict[str, Any]:
+    return _fail(
+        PvizErrorCode.NETWORK_ERROR,
+        "Invalid response from API",
+        details=details,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Private Repo Detection
 # -----------------------------------------------------------------------------
-async def _handle_private_repo_error(error_detail: str, status_code: int) -> Optional[Dict[str, Any]]:
+def _handle_private_repo_error(error_detail: str, status_code: int) -> Optional[Dict[str, Any]]:
     """
     Detect if error indicates private repo and return helpful response.
 
@@ -255,6 +281,14 @@ async def _get_identity_client() -> httpx.AsyncClient:
     return _make_client()
 
 
+async def _maybe_close_identity_client(client: httpx.AsyncClient) -> None:
+    if FORCE_FRESH_IDENTITY:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -278,9 +312,7 @@ def _validate_prefer_artifact(prefer: str) -> str:
     """Validate prefer_artifact parameter."""
     prefer = (prefer or "").strip().lower()
     if prefer not in ("standard", "compressed"):
-        raise PvizAPIError(
-            f"Invalid prefer_artifact value: '{prefer}'. Must be 'standard' or 'compressed'."
-        )
+        raise PvizAPIError(f"Invalid prefer_artifact value: '{prefer}'. Must be 'standard' or 'compressed'.")
     return prefer
 
 
@@ -298,9 +330,7 @@ async def _download_json_streaming(url: str) -> Dict[str, Any]:
                     continue
                 total += len(chunk)
                 if total > MAX_ARTIFACT_BYTES:
-                    raise PvizAPIError(
-                        f"Artifact exceeds size limit: {total} bytes > {MAX_ARTIFACT_BYTES} bytes"
-                    )
+                    raise PvizAPIError(f"Artifact exceeds size limit: {total} bytes > {MAX_ARTIFACT_BYTES} bytes")
                 chunks.append(chunk)
     except httpx.HTTPStatusError as e:
         raise PvizAPIError(f"Failed to download artifact: HTTP {e.response.status_code}") from e
@@ -308,7 +338,7 @@ async def _download_json_streaming(url: str) -> Dict[str, Any]:
         raise PvizAPIError(f"Artifact download timed out after {DOWNLOAD_TIMEOUT_S}s") from e
 
     try:
-        return httpx.Response(200, content=b"".join(chunks)).json()
+        return json.loads(b"".join(chunks))
     except Exception as e:
         raise PvizAPIError(f"Downloaded artifact is not valid JSON: {e}") from e
 
@@ -321,11 +351,9 @@ def _extract_summary_from_artifact(artifact: Dict[str, Any]) -> Optional[Dict[st
     """
     if not isinstance(artifact, dict):
         return None
-
     summary = artifact.get("summary")
     if not isinstance(summary, dict):
         return None
-
     return summary
 
 
@@ -343,19 +371,46 @@ def _terminal_error_code(raw_status: str) -> str:
     return PvizErrorCode.JOB_FAILED
 
 
+def _normalize_job_state(api: PvizAPIAdapter, status: Any) -> Tuple[str, str]:
+    """
+    Returns (raw_state, normalized_state) as lowercase strings (may be "").
+    """
+    raw_state = ""
+    normalized_state = ""
+    if isinstance(status, dict):
+        raw_state = (status.get("status") or "").lower().strip()
+    try:
+        normalized_state = (api.get_job_status_value(status) or "").lower().strip()
+    except Exception:
+        normalized_state = ""
+    return raw_state, normalized_state
+
+
+def _is_completed(raw_state: str, normalized_state: str) -> bool:
+    return raw_state == "completed" or normalized_state == "completed"
+
+
+def _is_terminal(raw_state: str, normalized_state: str) -> bool:
+    # preserve existing semantics: raw terminal states or normalized completed/failed
+    if raw_state in TERMINAL_STATES:
+        return True
+    if normalized_state in ("completed", "failed"):
+        return True
+    return False
+
+
 async def _wait_for_terminal(job_id: str) -> Dict[str, Any]:
     """Poll job status until terminal state or timeout."""
     api = _adapter()
     client = _get_client()
     sleep_s = max(0.1, POLL_MIN_SLEEP_S)
 
-    for attempt in range(MAX_POLL_ATTEMPTS):
+    for _attempt in range(MAX_POLL_ATTEMPTS):
         status = await api.get_job_status(client, job_id)
 
-        state = (api.get_job_status_value(status) or "").lower().strip()
-        raw_state = (status.get("status") or "").lower().strip() if isinstance(status, dict) else ""
+        raw_state, normalized_state = _normalize_job_state(api, status)
 
-        if state in ("completed", "failed"):
+        if normalized_state in ("completed", "failed"):
             return status
         if raw_state in TERMINAL_STATES:
             return status
@@ -403,6 +458,77 @@ def _pick_artifact_url(artifact_formats: Dict[str, Any], *, prefer: str) -> tupl
             f"This may indicate a job processing issue. Try prefer_artifact='compressed'."
         )
     return std.get("url"), "standard"
+
+
+async def _run_identity_call(
+    *,
+    call: Callable[[PvizAPIAdapter, httpx.AsyncClient], Awaitable[Any]],
+    on_invalid: Optional[Callable[[Any], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Run an identity-sensitive API call using an identity client and enforce the
+    FORCE_FRESH_IDENTITY close semantics.
+
+    This helper does not impose tool-specific error messages; callers can wrap
+    exceptions for more context if desired.
+    """
+    api = _adapter()
+    client = await _get_identity_client()
+    try:
+        result = await call(api, client)
+        if isinstance(result, dict):
+            return result
+        return (on_invalid or _invalid_response)(result)
+    finally:
+        await _maybe_close_identity_client(client)
+
+
+async def _fetch_job_artifact_payload(
+    *,
+    api: PvizAPIAdapter,
+    client: httpx.AsyncClient,
+    job_id: str,
+    prefer_artifact: str,
+    include_full_graph: bool,
+    artifacts_prefer_param: str,
+) -> Dict[str, Any]:
+    """
+    Shared artifact retrieval + download + summary extraction for completed jobs.
+
+    Returns a dict of:
+      - artifact_formats
+      - artifact_url (legacy [url, fmt])
+      - artifact_source
+      - summary (or None)
+      - _field_guide (when summary present)
+      - dependency_graph (optional)
+    """
+    artifacts = await api.get_job_artifacts(client, job_id, prefer=artifacts_prefer_param, force_fresh=True)
+    artifact_formats = artifacts.get("artifact_formats") if isinstance(artifacts, dict) else None
+    preferred_url, actual_format = _pick_artifact_url(artifact_formats or {}, prefer=prefer_artifact)
+
+    payload: Dict[str, Any] = {
+        "artifact_formats": artifact_formats,
+        "artifact_url": [preferred_url, actual_format],  # Keep for backward compatibility
+        "artifact_source": artifacts.get("source") if isinstance(artifacts, dict) else None,
+    }
+
+    if preferred_url:
+        full_artifact = await _download_json_streaming(preferred_url)
+
+        summary = _extract_summary_from_artifact(full_artifact)
+        if summary:
+            payload["summary"] = summary
+            payload["_field_guide"] = SUMMARY_FIELD_GUIDE
+        else:
+            payload["summary"] = None
+
+        if include_full_graph:
+            payload["dependency_graph"] = full_artifact
+    else:
+        payload["summary"] = None
+
+    return payload
 
 
 # =============================================================================
@@ -501,11 +627,7 @@ async def billing_diagnostics(limit_transactions: int = 20) -> Dict[str, Any]:
             },
         }
     finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        await _maybe_close_identity_client(client)
 
 
 # =============================================================================
@@ -523,32 +645,15 @@ async def get_account_info() -> Dict[str, Any]:
     RETURNS:
     - Account payload from PViz API, or a structured error with suggestion.
     """
-    api = _adapter()
-    client = await _get_identity_client()
     try:
-        result = await api.get_account_info(client, force_fresh=True)
-        if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
-        return result
+        return await _run_identity_call(call=lambda api, client: api.get_account_info(client, force_fresh=True))
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to retrieve account information",
-            "details": str(e),
-            "suggestion": "Check your authentication with debug_auth_fingerprint()",
-        }
-    finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to retrieve account information",
+            details=str(e),
+            suggestion="Check your authentication with debug_auth_fingerprint()",
+        )
 
 
 @mcp.tool()
@@ -562,32 +667,15 @@ async def get_token_balance() -> Dict[str, Any]:
     RETURNS:
     - Balance payload from PViz API, or a structured error.
     """
-    api = _adapter()
-    client = await _get_identity_client()
     try:
-        result = await api.get_token_balance(client, force_fresh=True)
-        if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
-        return result
+        return await _run_identity_call(call=lambda api, client: api.get_token_balance(client, force_fresh=True))
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to retrieve token balance",
-            "details": str(e),
-            "suggestion": "Check your authentication with debug_auth_fingerprint()",
-        }
-    finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to retrieve token balance",
+            details=str(e),
+            suggestion="Check your authentication with debug_auth_fingerprint()",
+        )
 
 
 @mcp.tool()
@@ -601,32 +689,15 @@ async def get_token_overview() -> Dict[str, Any]:
     RETURNS:
     - Overview payload from PViz API, or a structured error.
     """
-    api = _adapter()
-    client = await _get_identity_client()
     try:
-        result = await api.get_token_overview(client, force_fresh=True)
-        if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
-        return result
+        return await _run_identity_call(call=lambda api, client: api.get_token_overview(client, force_fresh=True))
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to retrieve token overview",
-            "details": str(e),
-            "suggestion": "Check your authentication with debug_auth_fingerprint()",
-        }
-    finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to retrieve token overview",
+            details=str(e),
+            suggestion="Check your authentication with debug_auth_fingerprint()",
+        )
 
 
 @mcp.tool()
@@ -640,32 +711,17 @@ async def get_token_transactions(skip: int = 0, limit: int = 50) -> Dict[str, An
     RETURNS:
     - Ledger payload from PViz API, or a structured error.
     """
-    api = _adapter()
-    client = await _get_identity_client()
     try:
-        result = await api.get_token_transactions(client, skip=skip, limit=limit, force_fresh=True)
-        if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
-        return result
+        return await _run_identity_call(
+            call=lambda api, client: api.get_token_transactions(client, skip=skip, limit=limit, force_fresh=True)
+        )
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to retrieve token transactions",
-            "details": str(e),
-            "suggestion": "Check your authentication with debug_auth_fingerprint()",
-        }
-    finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to retrieve token transactions",
+            details=str(e),
+            suggestion="Check your authentication with debug_auth_fingerprint()",
+        )
 
 
 @mcp.tool()
@@ -680,39 +736,23 @@ async def check_sufficient_balance(required_tokens: int) -> Dict[str, Any]:
     - Backend decision payload (sufficient / insufficient), or structured error.
     """
     if not isinstance(required_tokens, int) or required_tokens < 0:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.INVALID_PARAMETERS,
-            "error": "Invalid parameter",
-            "details": "required_tokens must be a positive integer",
-        }
+        return _fail(
+            PvizErrorCode.INVALID_PARAMETERS,
+            "Invalid parameter",
+            details="required_tokens must be a positive integer",
+        )
 
-    api = _adapter()
-    client = await _get_identity_client()
     try:
-        result = await api.check_sufficient_balance(client, required_tokens, force_fresh=True)
-        if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
-        return result
+        return await _run_identity_call(
+            call=lambda api, client: api.check_sufficient_balance(client, required_tokens, force_fresh=True)
+        )
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to check balance",
-            "details": str(e),
-            "suggestion": "Check your authentication with debug_auth_fingerprint()",
-        }
-    finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to check balance",
+            details=str(e),
+            suggestion="Check your authentication with debug_auth_fingerprint()",
+        )
 
 
 # =============================================================================
@@ -736,12 +776,11 @@ async def estimate_cost(
     try:
         repo_url = _normalize_repo_url(repo_url)
     except PvizAPIError as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.INVALID_PARAMETERS,
-            "error": "Invalid repository URL",
-            "details": str(e),
-        }
+        return _fail(
+            PvizErrorCode.INVALID_PARAMETERS,
+            "Invalid repository URL",
+            details=str(e),
+        )
 
     api = _adapter()
     client = _get_client()
@@ -749,12 +788,7 @@ async def estimate_cost(
     try:
         result = await api.estimate_cost(client, repo_url, github_token)
         if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
+            return _invalid_response(result)
         return result
     except httpx.HTTPStatusError as e:
         detail = str(e)
@@ -764,23 +798,21 @@ async def estimate_cost(
         except Exception:
             pass
 
-        private_error = await _handle_private_repo_error(detail, e.response.status_code)
+        private_error = _handle_private_repo_error(detail, e.response.status_code)
         if private_error:
             return private_error
 
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": f"HTTP {e.response.status_code}",
-            "details": detail,
-        }
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            f"HTTP {e.response.status_code}",
+            details=detail,
+        )
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to estimate cost",
-            "details": str(e),
-        }
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to estimate cost",
+            details=str(e),
+        )
 
 
 # =============================================================================
@@ -801,32 +833,17 @@ async def get_job_history(
     RETURNS:
     - Job history list with paging metadata (backend-defined).
     """
-    api = _adapter()
-    client = await _get_identity_client()
     try:
-        result = await api.get_job_history(client, limit=limit, skip=skip, force_fresh=True)
-        if not isinstance(result, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": result,
-            }
-        return result
+        return await _run_identity_call(
+            call=lambda api, client: api.get_job_history(client, limit=limit, skip=skip, force_fresh=True)
+        )
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to retrieve job history",
-            "details": str(e),
-            "suggestion": "Check your authentication with debug_auth_fingerprint()",
-        }
-    finally:
-        if FORCE_FRESH_IDENTITY:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to retrieve job history",
+            details=str(e),
+            suggestion="Check your authentication with debug_auth_fingerprint()",
+        )
 
 
 # =============================================================================
@@ -885,12 +902,11 @@ async def analyze_repository(
         repo_url = _normalize_repo_url(repo_url)
         prefer_artifact = _validate_prefer_artifact(prefer_artifact)
     except PvizAPIError as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.INVALID_PARAMETERS,
-            "error": "Invalid parameters",
-            "details": str(e),
-        }
+        return _fail(
+            PvizErrorCode.INVALID_PARAMETERS,
+            "Invalid parameters",
+            details=str(e),
+        )
 
     api = _adapter()
     client = _get_client()
@@ -911,23 +927,21 @@ async def analyze_repository(
         except Exception:
             pass
 
-        private_error = await _handle_private_repo_error(detail, e.response.status_code)
+        private_error = _handle_private_repo_error(detail, e.response.status_code)
         if private_error:
             return private_error
 
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": f"HTTP {e.response.status_code}",
-            "details": detail,
-        }
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            f"HTTP {e.response.status_code}",
+            details=detail,
+        )
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to submit analysis",
-            "details": str(e),
-        }
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to submit analysis",
+            details=str(e),
+        )
 
     job_id = api.extract_job_id(submit)
 
@@ -954,12 +968,9 @@ async def analyze_repository(
             "next_step": _next_step("get_analysis_status", {"job_id": job_id}),
         }
 
-    raw_status = (status.get("status") or "").lower().strip()
-    normalized = (api.get_job_status_value(status) or "").lower().strip()
-
-    is_completed = (raw_status == "completed") or (normalized == "completed")
-    if not is_completed:
-        terminal = raw_status or normalized or "unknown"
+    raw_state, normalized_state = _normalize_job_state(api, status)
+    if not _is_completed(raw_state, normalized_state):
+        terminal = raw_state or normalized_state or "unknown"
         return {
             "success": False,
             "error_code": _terminal_error_code(terminal),
@@ -970,10 +981,16 @@ async def analyze_repository(
             "next_step": _next_step("get_analysis_status", {"job_id": job_id}),
         }
 
+    # Completed: fetch artifacts, extract summary, optionally include full artifact
     try:
-        artifacts = await api.get_job_artifacts(client, job_id, prefer="both", force_fresh=True)
-        artifact_formats = artifacts.get("artifact_formats") if isinstance(artifacts, dict) else None
-        preferred_url, actual_format = _pick_artifact_url(artifact_formats or {}, prefer=prefer_artifact)
+        artifact_payload = await _fetch_job_artifact_payload(
+            api=api,
+            client=client,
+            job_id=job_id,
+            prefer_artifact=prefer_artifact,
+            include_full_graph=include_full_graph,
+            artifacts_prefer_param="both",  # preserve previous behavior in analyze_repository
+        )
     except PvizAPIError as e:
         return {
             "success": False,
@@ -984,6 +1001,16 @@ async def analyze_repository(
             "details": str(e),
             "message": "Job completed, but artifacts were unavailable in the requested format.",
         }
+    except Exception as e:
+        # Preserve prior behavior where download failures were handled after the URL selection.
+        # Here we map unknown errors to ARTIFACT_DOWNLOAD_FAILED to keep tooling consistent.
+        logger.warning(f"Failed to download artifact for summary extraction: {e}")
+        artifact_payload = {
+            "summary": None,
+            "error_code": PvizErrorCode.ARTIFACT_DOWNLOAD_FAILED,
+            "summary_error": str(e),
+            "message": "Artifact download failed; summary could not be extracted.",
+        }
 
     result: Dict[str, Any] = {
         "success": True,
@@ -992,33 +1019,15 @@ async def analyze_repository(
         "repo_url": status.get("repo_url"),
         "completed_at": status.get("completed_at") or datetime.utcnow().isoformat(),
         "tokens_charged": status.get("tokens_charged"),
-        "artifact_formats": artifact_formats,
-        "artifact_url": [preferred_url, actual_format],  # Keep for backward compatibility
-        "artifact_source": artifacts.get("source") if isinstance(artifacts, dict) else None,
     }
+    result.update(artifact_payload)
 
-    # Download and include summary
-    if preferred_url:
-        try:
-            full_artifact = await _download_json_streaming(preferred_url)
-
-            summary = _extract_summary_from_artifact(full_artifact)
-            if summary:
-                result["summary"] = summary
-                result["_field_guide"] = SUMMARY_FIELD_GUIDE
-
-            if include_full_graph:
-                result["dependency_graph"] = full_artifact
-        except PvizAPIError as e:
-            logger.warning(f"Failed to download artifact for summary extraction: {e}")
-            result["summary"] = None
-            result["error_code"] = PvizErrorCode.ARTIFACT_DOWNLOAD_FAILED
-            result["summary_error"] = str(e)
-            result["message"] = "Artifact download failed; summary could not be extracted."
-    else:
-        result["summary"] = None
-        result["error_code"] = PvizErrorCode.ARTIFACT_UNAVAILABLE
-        result["message"] = "No artifact URL available to extract summary."
+    # If no artifact URL was available, preserve prior messaging/error_code style
+    artifact_url = result.get("artifact_url")
+    if isinstance(artifact_url, list) and len(artifact_url) >= 1 and not artifact_url[0]:
+        result.setdefault("summary", None)
+        result.setdefault("error_code", PvizErrorCode.ARTIFACT_UNAVAILABLE)
+        result.setdefault("message", "No artifact URL available to extract summary.")
 
     return result
 
@@ -1041,27 +1050,22 @@ async def get_analysis_status(job_id: str) -> Dict[str, Any]:
     - Backend job status payload with additional helpful message + next_step hints when relevant.
     """
     if not job_id or not isinstance(job_id, str):
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.INVALID_PARAMETERS,
-            "error": "Invalid parameter",
-            "details": "job_id must be a non-empty string",
-        }
+        return _fail(
+            PvizErrorCode.INVALID_PARAMETERS,
+            "Invalid parameter",
+            details="job_id must be a non-empty string",
+        )
 
     api = _adapter()
     try:
         status = await api.get_job_status(_get_client(), job_id, force_fresh=True)
         if not isinstance(status, dict):
-            return {
-                "success": False,
-                "error_code": PvizErrorCode.NETWORK_ERROR,
-                "error": "Invalid response from API",
-                "details": status,
-            }
+            return _invalid_response(status)
 
-        raw_status = (status.get("status") or "").lower().strip()
+        raw_state, normalized_state = _normalize_job_state(api, status)
+        raw_status = raw_state  # preserve naming used elsewhere
 
-        # Add machine-readable guidance
+        # Add machine-readable guidance (preserve prior behavior keyed on raw_status)
         if raw_status == "in_progress":
             status["message"] = (
                 "Analysis is still running. Keep polling this tool with the same job_id. "
@@ -1082,13 +1086,12 @@ async def get_analysis_status(job_id: str) -> Dict[str, Any]:
 
         return status
     except Exception as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.NETWORK_ERROR,
-            "error": "Failed to retrieve job status",
-            "details": str(e),
-            "job_id": job_id,
-        }
+        return _fail(
+            PvizErrorCode.NETWORK_ERROR,
+            "Failed to retrieve job status",
+            details=str(e),
+            job_id=job_id,
+        )
 
 
 @mcp.tool()
@@ -1123,29 +1126,28 @@ async def retrieve_past_result(
         - If not completed: structured response with next_step=get_analysis_status
     """
     if not job_id or not isinstance(job_id, str):
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.INVALID_PARAMETERS,
-            "error": "Invalid parameter",
-            "details": "job_id must be a non-empty string",
-        }
+        return _fail(
+            PvizErrorCode.INVALID_PARAMETERS,
+            "Invalid parameter",
+            details="job_id must be a non-empty string",
+        )
 
     try:
         prefer_artifact = _validate_prefer_artifact(prefer_artifact)
     except PvizAPIError as e:
-        return {
-            "success": False,
-            "error_code": PvizErrorCode.INVALID_PARAMETERS,
-            "error": "Invalid parameter",
-            "details": str(e),
-        }
+        return _fail(
+            PvizErrorCode.INVALID_PARAMETERS,
+            "Invalid parameter",
+            details=str(e),
+        )
 
     api = _adapter()
     client = _get_client()
 
     try:
         status = await api.get_job_status(client, job_id, force_fresh=True)
-        raw_status = (status.get("status") or "").lower().strip()
+        raw_state, normalized_state = _normalize_job_state(api, status)
+        raw_status = raw_state
 
         if raw_status != "completed":
             # Treat as a controlled, guided non-terminal response (not a “hard error”).
@@ -1172,10 +1174,16 @@ async def retrieve_past_result(
             "next_step": _next_step("get_job_history", {"limit": 10, "skip": 0}),
         }
 
+    # Completed: fetch artifacts, extract summary, optionally include full artifact
     try:
-        artifacts = await api.get_job_artifacts(client, job_id, prefer=prefer_artifact, force_fresh=True)
-        artifact_formats = artifacts.get("artifact_formats") if isinstance(artifacts, dict) else None
-        preferred_url, actual_format = _pick_artifact_url(artifact_formats or {}, prefer=prefer_artifact)
+        artifact_payload = await _fetch_job_artifact_payload(
+            api=api,
+            client=client,
+            job_id=job_id,
+            prefer_artifact=prefer_artifact,
+            include_full_graph=include_full_graph,
+            artifacts_prefer_param=prefer_artifact,  # preserve previous behavior in retrieve_past_result
+        )
     except PvizAPIError as e:
         return {
             "success": False,
@@ -1185,44 +1193,36 @@ async def retrieve_past_result(
             "error": "Artifact retrieval failed",
             "details": str(e),
         }
+    except Exception as e:
+        # Preserve prior mapping: too large vs download failed
+        logger.warning(f"Failed to download artifact for job {job_id}: {e}")
+        artifact_payload = {
+            "error_code": (
+                PvizErrorCode.ARTIFACT_TOO_LARGE
+                if "exceeds size limit" in str(e).lower()
+                else PvizErrorCode.ARTIFACT_DOWNLOAD_FAILED
+            ),
+            "summary": None,
+            "summary_error": str(e),
+            "message": "Artifact download failed; summary could not be extracted.",
+        }
 
     result: Dict[str, Any] = {
         "success": True,
         "status": "completed",
         "job_id": job_id,
-        "repo_url": status.get("repo_url"),
-        "completed_at": status.get("completed_at"),
-        "tokens_charged": status.get("tokens_charged"),
-        "artifact_formats": artifact_formats,
-        "artifact_url": [preferred_url, actual_format],  # Keep for backward compatibility
-        "artifact_source": artifacts.get("source") if isinstance(artifacts, dict) else None,
+        "repo_url": status.get("repo_url") if isinstance(status, dict) else None,
+        "completed_at": status.get("completed_at") if isinstance(status, dict) else None,
+        "tokens_charged": status.get("tokens_charged") if isinstance(status, dict) else None,
     }
+    result.update(artifact_payload)
 
-    if preferred_url:
-        try:
-            full_artifact = await _download_json_streaming(preferred_url)
-
-            summary = _extract_summary_from_artifact(full_artifact)
-            if summary:
-                result["summary"] = summary
-                result["_field_guide"] = SUMMARY_FIELD_GUIDE
-
-            if include_full_graph:
-                result["dependency_graph"] = full_artifact
-        except PvizAPIError as e:
-            logger.warning(f"Failed to download artifact for job {job_id}: {e}")
-            result["error_code"] = (
-                PvizErrorCode.ARTIFACT_TOO_LARGE
-                if "exceeds size limit" in str(e).lower()
-                else PvizErrorCode.ARTIFACT_DOWNLOAD_FAILED
-            )
-            result["summary"] = None
-            result["summary_error"] = str(e)
-            result["message"] = "Artifact download failed; summary could not be extracted."
-    else:
-        result["error_code"] = PvizErrorCode.ARTIFACT_UNAVAILABLE
-        result["summary"] = None
-        result["message"] = "No artifact URL available to extract summary."
+    # If no artifact URL was available, preserve prior messaging/error_code style
+    artifact_url = result.get("artifact_url")
+    if isinstance(artifact_url, list) and len(artifact_url) >= 1 and not artifact_url[0]:
+        result.setdefault("error_code", PvizErrorCode.ARTIFACT_UNAVAILABLE)
+        result.setdefault("summary", None)
+        result.setdefault("message", "No artifact URL available to extract summary.")
 
     return result
 

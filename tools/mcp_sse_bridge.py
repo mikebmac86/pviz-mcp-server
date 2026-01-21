@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Set, List
+from typing import Any, Dict, Optional, Set, Tuple, List
 
 import httpx
 
@@ -59,6 +59,10 @@ class StdioReader:
 
     CRITICAL: stdin reads happen in a thread (asyncio.to_thread) so the event loop
     doesn't freeze and starve SSE/POST tasks.
+
+    Notes about mode:
+      - self.mode is latched ONLY after we successfully parse a message in that mode.
+        This avoids mis-detection from partial "Content-Length:" prefixes.
     """
 
     def __init__(self) -> None:
@@ -93,14 +97,23 @@ class StdioReader:
         if not b:
             return None
 
-        # Detect framed
-        if b.startswith(b"Content-Length:") or b.startswith(b"content-length:"):
-            self.mode = self.mode or "framed"
+        # If already latched, only try that mode.
+        if self.mode == "framed":
             return self._try_parse_framed()
+        if self.mode == "jsonl":
+            return self._try_parse_json_streaming()
 
-        # Otherwise JSONL-ish
-        self.mode = self.mode or "jsonl"
-        return self._try_parse_json_streaming()
+        # Not latched yet: attempt framed if it looks framed; otherwise JSON-streaming.
+        if b.startswith(b"Content-Length:") or b.startswith(b"content-length:"):
+            msg = self._try_parse_framed()
+            if msg is not None:
+                self.mode = "framed"
+            return msg
+
+        msg = self._try_parse_json_streaming()
+        if msg is not None:
+            self.mode = "jsonl"
+        return msg
 
     def _try_parse_framed(self) -> Optional[Dict[str, Any]]:
         hdr_end = self.buf.find(b"\r\n\r\n")
@@ -151,10 +164,11 @@ class StdioReader:
           - {"a":1}\n
           - {"a":1}{"b":2}
           - {"a":1}   (no newline yet; returns only if complete)
+
+        NOTE: For compatibility with the existing behavior, we keep the
+        bytes<->text sync strategy that round-trips via UTF-8 with errors="replace".
         """
         if self.buf:
-            # Keep text buffer in sync (append newly available bytes)
-            # Decode everything; it's ok because buf is bounded by reads.
             self._text_buf = self.buf.decode("utf-8", errors="replace")
 
         s = self._text_buf.lstrip()
@@ -165,13 +179,15 @@ class StdioReader:
         nl = s.find("\n")
         if nl >= 0:
             line = s[:nl].strip()
-            rest = s[nl + 1:]
             if not line:
-                self._consume_text_prefix(len(self._text_buf) - len(s) + nl + 1)
+                # consume through newline (including any leading whitespace we stripped)
+                leading_ws = len(self._text_buf) - len(s)
+                self._consume_text_prefix(leading_ws + nl + 1)
                 return None
             try:
                 obj = json.loads(line)
-                self._consume_text_prefix(len(self._text_buf) - len(s) + nl + 1)
+                leading_ws = len(self._text_buf) - len(s)
+                self._consume_text_prefix(leading_ws + nl + 1)
                 return obj
             except Exception:
                 # fall through to raw_decode
@@ -183,14 +199,13 @@ class StdioReader:
         except json.JSONDecodeError:
             return None
 
-        # Consume prefix including leading whitespace we stripped
         leading_ws = len(self._text_buf) - len(s)
         self._consume_text_prefix(leading_ws + end)
         return obj  # type: ignore[return-value]
 
     def _consume_text_prefix(self, n_chars: int) -> None:
         # Consume from text buffer and update bytes buffer accordingly.
-        # Re-encode the remainder to bytes for the framing detector.
+        # Re-encode the remainder to bytes for framing detector compatibility.
         if n_chars <= 0:
             return
         remaining = self._text_buf[n_chars:]
@@ -260,11 +275,12 @@ async def _aiter_sse_events(resp: httpx.Response):
             continue
         buf += chunk
         while True:
-            idx = buf.find(b"\n\n")
-            sep_len = 2
+            # Prefer CRLFCRLF if present (more specific), then LF LF.
+            idx = buf.find(b"\r\n\r\n")
+            sep_len = 4
             if idx < 0:
-                idx = buf.find(b"\r\n\r\n")
-                sep_len = 4
+                idx = buf.find(b"\n\n")
+                sep_len = 2
                 if idx < 0:
                     break
             frame = buf[:idx]
@@ -273,10 +289,6 @@ async def _aiter_sse_events(resp: httpx.Response):
             ev = _parse_sse_block(text)
             if ev:
                 yield ev
-
-
-async def _anext(ait):
-    return await ait.__anext__()
 
 
 # ---------------------------
@@ -462,34 +474,40 @@ class Bridge:
     async def _post_json_no_body_wait(self, url: str, msg: Dict[str, Any]) -> int:
         await self._ensure_post_client()
         assert self._post_client is not None
-        req = self._post_client.build_request(
-            "POST",
-            url,
-            json=msg,
-        )
+        req = self._post_client.build_request("POST", url, json=msg)
         resp = await self._post_client.send(req, stream=True)
         code = resp.status_code
         await resp.aclose()
         return code
 
+    async def _post_if_ready(self, msg: Dict[str, Any]) -> Optional[int]:
+        url = self._effective_messages_url()
+        if not url:
+            return None
+        return await self._post_json_no_body_wait(url, msg)
+
     async def _post_with_probe(self, msg: Dict[str, Any]) -> int:
-        if self._sse_messages_url:
-            return await self._post_json_no_body_wait(self._sse_messages_url, msg)
+        # 1) If SSE has already told us where to POST, use it.
+        ready = await self._post_if_ready(msg)
+        if ready is not None:
+            return ready
 
-        if self._latched_messages_url:
-            return await self._post_json_no_body_wait(self._latched_messages_url, msg)
-
+        # 2) Small grace period: allow endpoint event to arrive before probing.
         if self.endpoint_grace_s > 0:
             end = asyncio.get_running_loop().time() + float(self.endpoint_grace_s)
             while asyncio.get_running_loop().time() < end:
-                if self._sse_messages_url:
-                    return await self._post_json_no_body_wait(self._sse_messages_url, msg)
+                ready = await self._post_if_ready(msg)
+                if ready is not None:
+                    return ready
                 await asyncio.sleep(0.01)
 
+        # 3) Probe candidate endpoints until one looks like the messages endpoint.
         last_exc: Optional[Exception] = None
         for url in self._candidate_message_urls():
-            if self._sse_messages_url:
-                return await self._post_json_no_body_wait(self._sse_messages_url, msg)
+            # Endpoint may become ready mid-probe; prefer it if so.
+            ready = await self._post_if_ready(msg)
+            if ready is not None:
+                return ready
             try:
                 code = await self._post_json_no_body_wait(url, msg)
                 if code in (404, 405):
@@ -517,6 +535,8 @@ class Bridge:
             asyncio.create_task(self._stdio_out_loop(), name="stdio_out_loop"),
         ]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        # Stop first (helps loops exit promptly), then cancel remaining tasks.
+        self._stop.set()
         for t in pending:
             t.cancel()
         for t in done:
@@ -545,7 +565,7 @@ class Bridge:
                 events_iter = _aiter_sse_events(resp)
 
                 try:
-                    first_ev = await asyncio.wait_for(_anext(events_iter), timeout=self.sse_first_event_timeout_s)
+                    first_ev = await asyncio.wait_for(events_iter.__anext__(), timeout=self.sse_first_event_timeout_s)
                     await self._handle_sse_event(first_ev)
                 except asyncio.TimeoutError:
                     _warn("SSE connected but no first event yet; continuing without endpoint event.")
@@ -595,6 +615,11 @@ class Bridge:
 
             if "id" in msg and msg.get("id") in self._drop_response_ids and ("result" in msg or "error" in msg):
                 _log("SSE <- dropping remote response for locally-handled id=", msg.get("id"))
+                # Optional: prevent unbounded growth (safe)
+                try:
+                    self._drop_response_ids.discard(msg.get("id"))
+                except Exception:
+                    pass
                 return
 
             await self._remote_out_q.put(msg)
@@ -604,8 +629,6 @@ class Bridge:
     async def _pending_post_flusher_loop(self) -> None:
         while not self._stop.is_set():
             msg = await self._pending_posts.get()
-            if msg is None:
-                continue
             try:
                 code = await self._post_with_probe(msg)
                 _log("PENDING POST ->", code, "(url=", self._effective_messages_url(), ")")
