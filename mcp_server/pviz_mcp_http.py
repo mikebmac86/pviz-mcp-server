@@ -2,7 +2,7 @@
 HTTP/SSE Transport Wrapper for pviz MCP Server - PATCHED WITH DEBUGGING (Option A)
 
 Option A goal:
-  - Hosted MCP does NOT use a static PVIZ_JWT_TOKEN/PVIZ_JWT_TOKEN_FILE secret.
+  - Hosted MCP does NOT use a static PVIZ_JWT_TOKEN.
   - Instead, it binds the user's Authorization: Bearer <token> to the MCP session_id
     and makes that token available (per-request) to downstream MCP tool handlers
     via a ContextVar.
