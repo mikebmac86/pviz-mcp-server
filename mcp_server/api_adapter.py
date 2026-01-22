@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-
+import sys
 import httpx
 
 from .auth_context import PVIZ_REQUEST_BEARER  # type: ignore
@@ -114,20 +114,27 @@ class PvizAPIAdapter:
         if not _HAS_REQUEST_BEARER:
             return None
         try:
-            # Try context var first
+            # DEBUG: Check what we're getting
             v = PVIZ_REQUEST_BEARER.get()
+            print(f"[DEBUG] _get_request_bearer: v={repr(v)}", file=sys.stderr, flush=True)
+            
             if v and isinstance(v, str) and v.strip():
+                print(f"[DEBUG] Using request bearer: {token_fingerprint(v)[:8]}", file=sys.stderr, flush=True)
                 return v.strip()
 
             # Fallback: try session store (for async task context loss)
             from .auth_context import PVIZ_SESSION_ID, SESSION_BEARERS
 
             session_id = PVIZ_SESSION_ID.get()
+            print(f"[DEBUG] session_id from contextvar: {repr(session_id)}", file=sys.stderr, flush=True)
+            
             if session_id:
                 tok = SESSION_BEARERS.get(session_id)
+                print(f"[DEBUG] token from session store: {token_fingerprint(tok)[:8] if tok else 'none'}", file=sys.stderr, flush=True)
                 if tok and isinstance(tok, str) and tok.strip():
                     return tok.strip()
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] _get_request_bearer exception: {e}", file=sys.stderr, flush=True)
             pass
         return None
 
