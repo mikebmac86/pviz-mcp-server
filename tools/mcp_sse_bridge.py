@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple, List
 
@@ -312,14 +313,18 @@ def _env_str(name: str, default: str) -> str:
     return v.strip()
 
 
-def _build_urls(remote_base: str) -> Tuple[str, str]:
+def _build_urls(remote_base: str, session_id: str) -> Tuple[str, str]:
+    """Build SSE URL with session_id and origin URL"""
     base = remote_base.rstrip("/")
     if not base.endswith("/mcp"):
         if base.endswith("/mcp/sse"):
             base = base[: -len("/sse")]
         elif base.endswith("/sse"):
             base = base[: -len("/sse")]
-    sse_url = f"{base}/sse"
+    
+    # Build SSE URL with session_id query parameter
+    sse_url = f"{base}/sse?session_id={session_id}"
+    
     u = httpx.URL(base)
     origin = f"{u.scheme}://{u.host}"
     if u.port:
@@ -341,7 +346,10 @@ class Bridge:
         self.reconnect_s = _env_float("MCP_SSE_RECONNECT_S", 1.5)
         self.endpoint_grace_s = _env_float("MCP_ENDPOINT_GRACE_S", 0.35)
 
-        self.sse_url, self.origin = _build_urls(self.remote_base)
+        # Generate unique session ID for this bridge instance
+        self.session_id = str(uuid.uuid4())
+        
+        self.sse_url, self.origin = _build_urls(self.remote_base, self.session_id)
 
         self._sse_messages_url: Optional[str] = None
         self._latched_messages_url: Optional[str] = None
@@ -365,7 +373,7 @@ class Bridge:
             "accept-encoding": "identity",
             "connection": "keep-alive",
             "origin": self.origin,
-            "user-agent": "pviz-mcp-stdio-bridge/2.6",
+            "user-agent": "pviz-mcp-stdio-bridge/2.7",
         }
         if self.jwt:
             self._headers["authorization"] = f"Bearer {self.jwt}"
@@ -379,6 +387,7 @@ class Bridge:
 
         _warn(
             "BOOT remote_base=", self.remote_base,
+            "session_id=", self.session_id,
             "sse_url=", self.sse_url,
             "origin=", self.origin,
             "JWT present=", bool(self.jwt),
@@ -397,7 +406,13 @@ class Bridge:
             stdio_write_jsonl(msg)
 
     def _effective_messages_url(self) -> Optional[str]:
-        return self._sse_messages_url or self._latched_messages_url
+        """Get messages URL, ensuring it includes session_id"""
+        url = self._sse_messages_url or self._latched_messages_url
+        if url and "session_id=" not in url:
+            # Add session_id if not present
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}session_id={self.session_id}"
+        return url
 
     async def _ensure_post_client(self) -> None:
         if self._post_client is not None:
@@ -459,13 +474,23 @@ class Bridge:
             "result": {
                 "protocolVersion": pv,
                 "capabilities": caps,
-                "serverInfo": {"name": "pviz-mcp-remote-bridge", "version": "2.6"},
+                "serverInfo": {"name": "pviz-mcp-remote-bridge", "version": "2.7"},
             },
         }
 
     def _candidate_message_urls(self) -> List[str]:
+        """Generate candidate URLs with session_id included"""
         base = self.remote_base.rstrip("/")
-        return [base, f"{base}/message", f"{base}/messages"]
+        candidates = [base, f"{base}/message", f"{base}/messages"]
+        
+        # Ensure all candidates have session_id
+        result = []
+        for url in candidates:
+            if "session_id=" not in url:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}session_id={self.session_id}"
+            result.append(url)
+        return result
 
     @staticmethod
     def _is_success_latch_status(code: int) -> bool:

@@ -473,13 +473,16 @@ _log("[pviz_mcp_http]", f"SSE app created: {type(mcp_asgi_app)}")
 
 mcp_wrapped = mcp_asgi_app
 
-# Optional: bind session_id from SSE "endpoint" event (additive)
-BIND_FROM_SSE_ENDPOINT = _bool_env("MCP_BIND_FROM_SSE_ENDPOINT", False)
+# Always bind session_id from SSE "endpoint" event to handle MCP SDK-generated session IDs.
+# This is essential because mcp.sse_app() generates its own session_id internally,
+# which differs from any client-provided session_id in the query string.
+# This middleware intercepts the SSE stream, extracts the server-generated session_id
+# from the "endpoint" event, and binds it to the Authorization bearer token.
 mcp_wrapped = MCPSseEndpointSessionBindMiddleware(
-    mcp_wrapped, enabled=BIND_FROM_SSE_ENDPOINT
+    mcp_wrapped, enabled=True
 )
 
-# Primary binder: sets ContextVars + binds session_id when present
+# Primary binder: sets ContextVars + binds session_id when present in request
 mcp_wrapped = MCPAuthBindMiddleware(mcp_wrapped)
 
 # -----------------------------------------------------------------------------
@@ -545,15 +548,15 @@ _log("[pviz_mcp_http]", "Server initialization complete")
 _log("[pviz_mcp_http]", f"MCP allowed_hosts (expanded): {_mcp_allowed_hosts}")
 _log("[pviz_mcp_http]", f"MCP allowed_origins: {_mcp_allowed_origins}")
 _log("[pviz_mcp_http]", f"Starlette allowed_hosts (sanitized): {starlette_allowed_hosts}")
-_log("[pviz_mcp_http]", f"SSE endpoint bind enabled: {BIND_FROM_SSE_ENDPOINT}")
 _log("[pviz_mcp_http]", "")  # spacer
 
 # -----------------------------------------------------------------------------
-# Optional cleanup loop (safe, off by default)
+# Session cleanup loop - removes stale session_id -> bearer bindings
 # -----------------------------------------------------------------------------
 
-
-CLEANUP_EVERY_S = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "0") or "0")
+# Default to 1 hour cleanup interval to prevent unbounded memory growth
+# from orphaned client-generated session_ids
+CLEANUP_EVERY_S = int(os.getenv("MCP_SESSION_CLEANUP_EVERY_S", "3600") or "3600")
 
 
 async def _cleanup_loop() -> None:
@@ -576,7 +579,6 @@ async def _cleanup_loop() -> None:
 async def _on_startup() -> None:
     if CLEANUP_EVERY_S > 0:
         asyncio.create_task(_cleanup_loop())
-
 
 if __name__ == "__main__":
     import uvicorn
