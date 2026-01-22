@@ -179,8 +179,8 @@ def _path_from_scope(scope) -> str:
 # -----------------------------------------------------------------------------
 
 
-DEBUG_HTTP = _bool_env("MCP_DEBUG_HTTP", False)
-DEBUG_AUTH = _bool_env("MCP_DEBUG_AUTH_BIND", False)
+DEBUG_HTTP = _bool_env("MCP_DEBUG_HTTP", True)
+DEBUG_AUTH = _bool_env("MCP_DEBUG_AUTH_BIND", True)
 DEBUG_TRANSPORT_SECURITY = _bool_env("MCP_DEBUG_TRANSPORT_SECURITY", True)
 
 
@@ -289,7 +289,7 @@ class MCPAuthBindMiddleware:
         finally:
             PVIZ_REQUEST_BEARER.reset(token_ctx)
             PVIZ_SESSION_ID.reset(session_ctx)
-            
+
 # -----------------------------------------------------------------------------
 # Optional SSE endpoint sniffing middleware (SSE-safe)
 #
