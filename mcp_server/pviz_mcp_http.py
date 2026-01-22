@@ -213,7 +213,6 @@ def _log_ts(*parts: object) -> None:
 # responses (StreamingResponse / SSE). This is ASGI-native and streaming-safe.
 # -----------------------------------------------------------------------------
 
-
 class MCPAuthBindMiddleware:
     """
     ASGI-native middleware (SSE-safe).
@@ -238,13 +237,37 @@ class MCPAuthBindMiddleware:
         session_id = _session_id_from_scope(scope)
         path = _path_from_scope(scope)
 
+        # DEBUG: Log what we're extracting from scope
+        if DEBUG_AUTH and (
+            path.endswith("/sse") or path.endswith("/messages") or "/messages" in path
+        ):
+            _log_auth(
+                "SCOPE DEBUG",
+                "path=", path,
+                "query_string=", scope.get("query_string", b"").decode("utf-8", errors="replace"),
+                "session_id=", session_id[:16] if session_id else "none",
+                "bearer_present=", "yes" if bool(bearer) else "no",
+            )
+
         # Bind token when present (authoritative; overwrites prior mapping).
         if bearer and session_id:
             SESSION_BEARERS.set(session_id, bearer)
+            if DEBUG_AUTH:
+                _log_auth(
+                    "SESSION_STORE BIND",
+                    "session_id=", session_id[:16],
+                    "token_fp=", token_fingerprint(bearer)[:8],
+                )
 
         # Fallback: if token missing but we have session_id, try store
         if (not bearer) and session_id:
             bearer = SESSION_BEARERS.get(session_id)
+            if DEBUG_AUTH and bearer:
+                _log_auth(
+                    "SESSION_STORE RETRIEVE",
+                    "session_id=", session_id[:16],
+                    "token_fp=", token_fingerprint(bearer)[:8],
+                )
 
         token_ctx = PVIZ_REQUEST_BEARER.set(bearer)
         session_ctx = PVIZ_SESSION_ID.set(session_id if session_id else None)
@@ -258,6 +281,7 @@ class MCPAuthBindMiddleware:
                 "session_id=", "yes" if bool(session_id) else "no",
                 "bearer_present=", "yes" if bool(bearer) else "no",
                 "token_fp=", token_fingerprint(bearer)[:8] if bearer else "none",
+                "contextvar_set=", "yes" if PVIZ_REQUEST_BEARER.get() else "no",
             )
 
         try:
@@ -265,8 +289,7 @@ class MCPAuthBindMiddleware:
         finally:
             PVIZ_REQUEST_BEARER.reset(token_ctx)
             PVIZ_SESSION_ID.reset(session_ctx)
-
-
+            
 # -----------------------------------------------------------------------------
 # Optional SSE endpoint sniffing middleware (SSE-safe)
 #
