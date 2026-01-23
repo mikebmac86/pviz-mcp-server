@@ -141,6 +141,7 @@ with github token ghp_xxxxx
 ✅ JavaScript (`.js`, `.jsx`)  
 ✅ Java (`.java`)  
 ✅ Go (`.go`)
+✅ Rust (`.rs`)
 
 ---
 

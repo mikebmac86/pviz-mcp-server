@@ -257,7 +257,7 @@ def main():
     print("🚀 pviz MCP Server - Quick Start")
     print("="*70)
     print("\nVersion 2.0 - Comprehensive dependency analysis for Python, TypeScript,")
-    print("JavaScript, Java, and Go repositories")
+    print("JavaScript, Java, Rust, and Go repositories")
     
     print("\n📋 Running Environment Checks...")
     

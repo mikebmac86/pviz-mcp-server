@@ -1036,7 +1036,7 @@ def call_api_with_retry(url, headers, json_data, max_retries=3):
 
 ## Repository & Language Limits
 
-Languages supported: Python, TypeScript, JavaScript, Java, Go.
+Languages supported: Python, Rust, TypeScript, JavaScript, Java, Go.
 
 ---
 

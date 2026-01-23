@@ -1,7 +1,7 @@
 {
   "name": "pviz-dependency-analyzer",
   "displayName": "pviz Dependency Analyzer",
-  "description": "Polyglot dependency analysis for codebases. Detects circular dependencies, extracts metrics, and visualizes architecture for Python, TypeScript, JavaScript, Java, and Go projects.",
+  "description": "Polyglot dependency analysis for codebases. Detects circular dependencies, extracts metrics, and visualizes architecture for Python, Rust, TypeScript, JavaScript, Java, and Go projects.",
   "version": "2.0.0",
   "author": {
     "name": "pviz Team",
@@ -30,6 +30,7 @@
     "typescript",
     "python",
     "java",
+    "rust",
     "go",
     "architecture",
     "polyglot"
@@ -197,6 +198,7 @@
     "Python",
     "TypeScript",
     "JavaScript",
+    "Rust",
     "Java",
     "Go"
   ],

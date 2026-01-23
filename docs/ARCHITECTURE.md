@@ -397,6 +397,7 @@ pviz-artifacts/
    │  ├─ Python: import statements
    │  ├─ TypeScript/JS: import/require
    │  ├─ Java: import statements
+   │  ├─ Rust: import statements
    │  └─ Go: import statements
    ├─ Build dependency graph
    ├─ Detect circular dependencies

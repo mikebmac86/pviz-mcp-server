@@ -683,6 +683,7 @@ All tools may return errors in this format:
 - JavaScript (`.js`, `.jsx`)
 - Java (`.java`)
 - Go (`.go`)
+- Rust (`.rs`)
 
 ### Unsupported Features
 

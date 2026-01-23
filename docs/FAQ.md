@@ -107,6 +107,7 @@ Currently supported:
 - **JavaScript** (`.js`, `.jsx`)
 - **Java** (`.java`)
 - **Go** (`.go`)
+- **Rust** (`.rs`)
 
 ### What about other languages?
 
